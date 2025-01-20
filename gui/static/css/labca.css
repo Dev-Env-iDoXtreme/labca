@@ -1,0 +1,224 @@
+.error {
+    color: #d9534f;
+}
+
+.warning {
+    color: #f0ad4e;
+}
+
+.success {
+    color: #5cb85c;
+}
+
+.strength-none {
+    background-color: #bbb;
+}
+
+.strength-bad {
+    background-color: #d9534f;
+}
+
+.strength-med {
+    background-color: #f0ad4e;
+}
+
+.strength-good {
+    background-color: #5cb85c;
+}
+
+.footer {
+    padding-top: 20px;
+}
+
+.hidden {
+    display: none;
+}
+
+.dataTables_filter, .dataTables_paginate {
+    float: right;
+}
+
+.pagination {
+    margin: 0;
+}
+
+.fixed-corner {
+    position: fixed;
+    bottom: 0;
+    right: 2px;
+    padding: 0 7px;
+    font-style: italic;
+    font-size: small;
+}
+
+#fileData {
+    margin-top: 1em;
+}
+
+.admin-login {
+    color: #555;
+}
+
+a.public {
+    color: forestgreen;
+}
+
+i.ext-link {
+    font-size: smaller;
+}
+
+p.caption {
+    padding-top: 0.8em;
+}
+
+.mb0 {
+    margin-bottom: 0px;
+}
+
+.mb5 {
+    margin-bottom: 5px;
+}
+
+.mb15 {
+    margin-bottom: 15px;
+}
+
+.ml20 {
+    margin-left: 20px;
+}
+
+.mt5 {
+    margin-top: 5px;
+}
+
+.mt10 {
+    margin-top: 10px;
+}
+
+.mt20 {
+    margin-top: 20px;
+}
+
+.p48>tbody>tr>td {
+    padding: 4px 8px;
+}
+
+td.pad-low-bottom {
+    padding-bottom: 4px !important;
+}
+
+td.pad-low {
+    padding-top: 4px !important;
+    padding-bottom: 4px !important;
+}
+
+td.pad-low-top {
+    padding-top: 4px !important;
+}
+
+.btn-reg {
+    width: 5em;
+}
+
+.btn-wide {
+    width: 10em;
+}
+
+.btn-new-issuer {
+    width: 7em;
+}
+
+.btn-6em {
+    width: 6em;
+}
+
+.btn-right {
+    float: right;
+}
+
+.vmiddle {
+    vertical-align: middle !important;
+}
+
+.center {
+    text-align: center !important;
+}
+
+.bd-modal-lg .modal-dialog {
+    display: table;
+    position: relative;
+    margin: 0 auto;
+    top: calc(40% - 24px);
+}
+
+.bd-modal-lg .modal-dialog .modal-content {
+    text-align: center;
+    border: none;
+}
+
+.modal-content {
+    padding: 6px;
+    width: 674px;
+}
+
+.modal-content > textarea {
+    width: 660px;
+    height: 550px;
+}
+
+.non-fluid {
+    width: auto !important;
+}
+
+.vizpwd {
+    float: left;
+    margin-left: 180px;
+    margin-top: -23px;
+    position: relative;
+    z-index: 2;
+}
+
+a.update {
+    color: darkgreen;
+}
+
+a.update:hover {
+    text-decoration: none;
+}
+
+.bootstrap-dialog .modal-header {
+  border-top-left-radius: 4px;
+  border-top-right-radius: 4px;
+}
+
+.bootstrap-dialog.type-primary .modal-header {
+  background-color: #f5f5f5;
+}
+
+.rel-notes-title {
+  font-weight: bold;
+}
+
+pre.json {
+    background-color: transparent;
+    border: none;
+    margin: 0px;
+    padding: 0px;
+}
+
+.hide-overflow {
+    overflow: hidden;
+}
+
+#modal-spinner {
+    z-index: 10000;
+}
+
+button.close {
+    margin-top: -40px;
+}
+
+.form-small-inline {
+    display: inline-block;
+    width: 5em !important;
+}

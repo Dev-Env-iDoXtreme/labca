@@ -1,0 +1,13 @@
+diff --git a/config/duration.go b/config/duration.go
+index 90cb2277d..44b56bc18 100644
+--- a/config/duration.go
++++ b/config/duration.go
+@@ -10,7 +10,7 @@ import (
+ // Duration is custom type embedding a time.Duration which allows defining
+ // methods such as serialization to YAML or JSON.
+ type Duration struct {
+-	time.Duration `validate:"required"`
++	time.Duration
+ }
+ 
+ // DurationCustomTypeFunc enables registration of our custom config.Duration

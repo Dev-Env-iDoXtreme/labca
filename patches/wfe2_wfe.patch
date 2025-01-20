@@ -1,0 +1,64 @@
+diff --git a/wfe2/wfe.go b/wfe2/wfe.go
+index a41472e54..42d2974c4 100644
+--- a/wfe2/wfe.go
++++ b/wfe2/wfe.go
+@@ -24,6 +24,7 @@ import (
+ 	"google.golang.org/protobuf/types/known/durationpb"
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ 
++	"github.com/letsencrypt/boulder/cmd"
+ 	"github.com/letsencrypt/boulder/core"
+ 	corepb "github.com/letsencrypt/boulder/core/proto"
+ 	berrors "github.com/letsencrypt/boulder/errors"
+@@ -171,6 +172,8 @@ type WebFrontEndImpl struct {
+ 	// descriptions (perhaps including URLs) of those profiles. NewOrder
+ 	// Requests with a profile name not present in this map will be rejected.
+ 	certProfiles map[string]string
++
++	hostnamePolicyFile string
+ }
+ 
+ // NewWebFrontEndImpl constructs a web service for Boulder
+@@ -198,6 +201,7 @@ func NewWebFrontEndImpl(
+ 	unpauseSigner unpause.JWTSigner,
+ 	unpauseJWTLifetime time.Duration,
+ 	unpauseURL string,
++	hostnamePolicyFile string,
+ ) (WebFrontEndImpl, error) {
+ 	if len(issuerCertificates) == 0 {
+ 		return WebFrontEndImpl{}, errors.New("must provide at least one issuer certificate")
+@@ -239,6 +243,7 @@ func NewWebFrontEndImpl(
+ 		unpauseSigner:                unpauseSigner,
+ 		unpauseJWTLifetime:           unpauseJWTLifetime,
+ 		unpauseURL:                   unpauseURL,
++		hostnamePolicyFile:           hostnamePolicyFile,
+ 	}
+ 
+ 	return wfe, nil
+@@ -2302,8 +2307,25 @@ func (wfe *WebFrontEndImpl) NewOrder(
+ 		names[i] = ident.Value
+ 	}
+ 
++	logger := cmd.NewLogger(cmd.SyslogConfig{StdoutLevel: 7})
++	pa, err := policy.New(map[core.AcmeChallenge]bool{}, logger)
++	if err != nil {
++		wfe.sendError(response, logEvent, probs.Malformed("cannot create policy authority implementation"), nil)
++		return
++	}
++
++	if wfe.hostnamePolicyFile == "" {
++		wfe.sendError(response, logEvent, probs.Malformed("HostnamePolicyFile must be provided in config"), nil)
++		return
++	}
++	err = pa.LoadHostnamePolicyFile(wfe.hostnamePolicyFile)
++	if err != nil {
++		wfe.sendError(response, logEvent, probs.Malformed("couldn't load hostname policy file"), nil)
++		return
++	}
++
+ 	names = core.UniqueLowerNames(names)
+-	err = policy.WellFormedDomainNames(names)
++	err = pa.WellFormedDomainNames(names)
+ 	if err != nil {
+ 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Invalid identifiers requested"), nil)
+ 		return

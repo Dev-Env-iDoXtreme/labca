@@ -4,21 +4,32 @@ set -e
 
 [ -d bin ] || mkdir bin
 
-[ -e bin/labca ] || set -ev
-if [ ! -e bin/labca ]; then
-    go get github.com/biz/templates
-    go get github.com/go-sql-driver/mysql
-    go get github.com/dustin/go-humanize
-    go get github.com/google/go-github/github
-    go get github.com/gorilla/mux
-    go get github.com/gorilla/securecookie
-    go get github.com/gorilla/sessions
-    go get github.com/gorilla/websocket
-    go get github.com/nbutton23/zxcvbn-go
-    go get github.com/theherk/viper
-    go get golang.org/x/crypto/bcrypt
+[ -e bin/labca-gui ] || set -ev
+if [ ! -e bin/labca-gui ]; then
+    go mod download
 
-    go build -o bin/labca main.go acme.go certificate.go dashboard.go
+    go build -buildvcs=false -o bin/labca-gui -ldflags="-X 'main.standaloneVersion=$GIT_VERSION'"
 fi
 
-bin/labca
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y iproute2 zip unzip
+apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg
+install -m 0755 -d /etc/apt/keyrings
+[ ! -e /etc/apt/keyrings/docker.gpg ] || mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg_PREV
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+dcver=$(docker compose version | grep v2.19 | wc -l)
+if [ "$dcver" != "0" ]; then
+    dc18=$(apt list docker-compose-plugin -a 2>/dev/null | grep 2.18 | cut -d ' ' -f 2)
+    apt install -y --allow-downgrades docker-compose-plugin=${dc18}
+fi
+
+bin/labca-gui

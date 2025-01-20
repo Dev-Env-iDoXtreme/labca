@@ -1,0 +1,23 @@
+diff --git a/test/config/publisher.json b/test/config/publisher.json
+index 6e0337c..1e5ed7b 100644
+--- a/test/config/publisher.json
++++ b/test/config/publisher.json
+@@ -6,18 +6,6 @@
+ 			[
+ 				"test/certs/webpki/int-rsa-a.cert.pem",
+ 				"test/certs/webpki/root-rsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-rsa-b.cert.pem",
+-				"test/certs/webpki/root-rsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-a.cert.pem",
+-				"test/certs/webpki/root-ecdsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-b.cert.pem",
+-				"test/certs/webpki/root-ecdsa.cert.pem"
+ 			]
+ 		],
+ 		"debugAddr": ":8009",

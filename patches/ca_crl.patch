@@ -1,0 +1,17 @@
+diff --git a/ca/crl.go b/ca/crl.go
+index 5937046fe..15c144984 100644
+--- a/ca/crl.go
++++ b/ca/crl.go
+@@ -132,8 +132,10 @@ func (ci *crlImpl) GenerateCRL(stream grpc.BidiStreamingServer[capb.GenerateCRLR
+ 				builder = strings.Builder{}
+ 			}
+ 		}
+-		fmt.Fprint(&builder, "]")
+-		ci.log.AuditInfo(builder.String())
++		if builder.Len() > 0 {
++			fmt.Fprint(&builder, "]")
++			ci.log.AuditInfo(builder.String())
++		}
+ 	}
+ 
+ 	req.Entries = rcs

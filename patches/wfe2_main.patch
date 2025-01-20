@@ -1,0 +1,30 @@
+diff --git a/cmd/boulder-wfe2/main.go b/cmd/boulder-wfe2/main.go
+index 699ed0d78..01ae1f741 100644
+--- a/cmd/boulder-wfe2/main.go
++++ b/cmd/boulder-wfe2/main.go
+@@ -105,7 +105,7 @@ type Config struct {
+ 		// DirectoryCAAIdentity is used for the /directory response's "meta"
+ 		// element's "caaIdentities" field. It should match the VA's "issuerDomain"
+ 		// configuration value (this value is the one used to enforce CAA)
+-		DirectoryCAAIdentity string `validate:"required,fqdn"`
++		DirectoryCAAIdentity string `validate:"required"`
+ 		// DirectoryWebsite is used for the /directory response's "meta" element's
+ 		// "website" field.
+ 		DirectoryWebsite string `validate:"required,url"`
+@@ -192,6 +192,8 @@ type Config struct {
+ 			// to enable the pausing feature.
+ 			URL string `validate:"omitempty,required_with=HMACKey JWTLifetime,url,startswith=https://,endsnotwith=/"`
+ 		}
++
++		cmd.HostnamePolicyConfig
+ 	}
+ 
+ 	Syslog        cmd.SyslogConfig
+@@ -403,6 +405,7 @@ func main() {
+ 		unpauseSigner,
+ 		c.WFE.Unpause.JWTLifetime.Duration,
+ 		c.WFE.Unpause.URL,
++		c.WFE.HostnamePolicyFile,
+ 	)
+ 	cmd.FailOnError(err, "Unable to create WFE")
+ 
