@@ -2,7 +2,7 @@
 
 set -e
 
-FILE=/home/labca/backup/$1
+FILE=/opt/backup/$1
 
 [ "$1" != "" ] || (echo "You must provide a backup file name to restore"; exit 1)
 [ -f $FILE ] || (echo "Backup file '$FILE' not found"; exit 1)
@@ -11,13 +11,30 @@ BASE=$(echo "$FILE" | perl -p0e "s/.*\/(.*).tgz/\1/")
 TMPDIR=/tmp/$BASE
 
 cd /tmp
-tar xzf $FILE
+tar xzf $FILE 2>&1
 
-cd /home/labca/boulder
-docker-compose exec bmysql mysql boulder_sa_integration <$TMPDIR/boulder_sa_integration.sql
+cd /opt/boulder
+[ -f $TMPDIR/boulder_sa_integration.sql ] || (echo "MySQL backup file not found"; exit 1)
+sed -i -e "s/\(INSERT INTO \`gorp_migrations\`.*\)/-- \1/" $TMPDIR/boulder_sa_integration.sql
+docker compose exec bmysql mysql boulder_sa_integration <$TMPDIR/boulder_sa_integration.sql
 
 mv -f $TMPDIR/*key* $TMPDIR/*cert.pem $TMPDIR/*.csr /etc/nginx/ssl/
 
-rm -rf /home/labca/admin/data && mv $TMPDIR/data /home/labca/admin/
+[ -d  $TMPDIR/data ] || (echo "Data folder backup not found"; exit 1)
+vrs=$(grep version /opt/labca/data/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
+rm -rf /opt/labca/data/* && mv $TMPDIR/data/* /opt/labca/data/
+sed -i -e "s/\"version\": \".*\"/\"version\": \"$vrs\"/" /opt/labca/data/config.json
+
+if [ -d  $TMPDIR/webpki ]; then
+    rm -rf /opt/boulder/labca/certs/webpki/* && mv $TMPDIR/webpki/* /opt/boulder/labca/certs/webpki/
+else
+    echo "WARNING: public CA files not found in backup"
+fi
+
+if [ -d  $TMPDIR/tokens ]; then
+    rm -rf /var/lib/softhsm/tokens/* && mv $TMPDIR/tokens/* /var/lib/softhsm/tokens/
+else
+    echo "WARNING: SoftHSMv2 tokens folder not found in backup"
+fi
 
 rm -rf $TMPDIR

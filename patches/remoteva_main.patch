@@ -1,0 +1,24 @@
+diff --git a/cmd/remoteva/main.go b/cmd/remoteva/main.go
+index 97320f971..6df388e3f 100644
+--- a/cmd/remoteva/main.go
++++ b/cmd/remoteva/main.go
+@@ -60,7 +60,8 @@ type Config struct {
+ 		// For more information, see: https://pkg.go.dev/crypto/tls#ClientAuthType
+ 		SkipGRPCClientCertVerification bool
+ 
+-		Features features.Config
++		Features     features.Config
++		LabCADomains []string
+ 	}
+ 
+ 	Syslog        cmd.SyslogConfig
+@@ -142,7 +143,8 @@ func main() {
+ 		logger,
+ 		c.RVA.AccountURIPrefixes,
+ 		c.RVA.Perspective,
+-		c.RVA.RIR)
++		c.RVA.RIR,
++		c.RVA.LabCADomains)
+ 	cmd.FailOnError(err, "Unable to create Remote-VA server")
+ 
+ 	start, err := bgrpc.NewServer(c.RVA.GRPC, logger).Add(

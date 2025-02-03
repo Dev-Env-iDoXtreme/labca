@@ -1,0 +1,54 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        GO_VERSION:
+          - 1.23.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.GO_VERSION }}
+
+      - name: APT Install
+        id: aptInstall
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get -y install build-essential debhelper fakeroot crossbuild-essential-arm64
+
+      - name: Build Debian packages
+        id: make_debian
+        run: |
+          make debian
+          make debian-arm64
+
+      - name: Create changelog text
+        id: changelog
+        uses: loopwerk/tag-changelog@v1
+        with:
+          token: ${{ secrets.ACTION_PAT }}
+
+      - name: Create release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "release/*"
+          body: ${{ steps.changelog.outputs.changes }}
+          draft: true
+          token: ${{ secrets.ACTION_PAT }}

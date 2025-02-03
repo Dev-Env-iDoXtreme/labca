@@ -2,22 +2,24 @@
 
 set -e
 
-PKI_PWD=$(pwd)
-export PKI_ROOT_CERT_BASE="$PKI_PWD/$PKI_ROOT_CERT_BASE"
-export PKI_INT_CERT_BASE="$PKI_PWD/$PKI_INT_CERT_BASE"
+baseDir=$(cd $(dirname $0) && pwd)
+dataDir="/opt/boulder/labca/certs/webpki"
 
-cd /wwwstatic
+export PKI_ROOT_CERT_BASE="$dataDir/root-01-cert"
+export PKI_INT_CERT_BASE="$dataDir/issuer-01-cert"
 
-$PKI_PWD/apply-nginx
+cd /opt/boulder/labca
+$baseDir/apply-boulder
 
-cp $PKI_ROOT_CERT_BASE.crl crl/
+cd /var/www/html
+
+PKI_ROOT_CRL_FILE=${PKI_ROOT_CERT_BASE/-cert/-crl}.pem
+if [ -e "$PKI_ROOT_CRL_FILE" ]; then
+    cp $PKI_ROOT_CRL_FILE crl/
+else
+    echo "WARNING: no Root CRL file present - please upload one from the manage page"
+fi
 cp $PKI_ROOT_CERT_BASE.pem certs/
-cp $PKI_ROOT_CERT_BASE.der certs/
 cp $PKI_INT_CERT_BASE.pem certs/
-cp $PKI_INT_CERT_BASE.der certs/
 
-chown -R www-data:www-data .
-
-
-cd /boulder/labca
-$PKI_PWD/apply-boulder
+$baseDir/apply-nginx

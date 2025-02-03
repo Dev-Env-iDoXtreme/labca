@@ -1,0 +1,139 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 81a92bbe6..49e3c2797 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -4,7 +4,7 @@ services:
+     # The `letsencrypt/boulder-tools:latest` tag is automatically built in local
+     # dev environments. In CI a specific BOULDER_TOOLS_TAG is passed, and it is
+     # pulled with `docker compose pull`.
+-    image: &boulder_tools_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-latest}
++    image: ghcr.io/hakwerk/labca-boulder:${LABCA_IMAGE_VERSION:-latest}
+     build:
+       context: test/boulder-tools/
+       # Should match one of the GO_CI_VERSIONS in test/boulder-tools/tag_and_upload.sh.
+@@ -19,11 +19,10 @@ services:
+       GOCACHE: /boulder/.gocache/go-build
+       GOFLAGS: -mod=vendor
+     volumes:
+-      - .:/opt/boulder:cached
+-      - /home/labca/boulder_labca:/opt/boulder/labca
+-      - /home/labca/nginx_data/static:/var/www/html
+-      - ./.gocache:/root/.cache/go-build:cached
+-      - /home/labca/boulder_labca/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/
++      - boulder_data:/opt/boulder/labca
++      - certificates:/opt/boulder/labca/certs
++      - nginx_html:/var/www/html
++      - softhsm:/var/lib/softhsm/tokens
+     networks:
+       bouldernet:
+         ipv4_address: 10.77.77.77
+@@ -91,35 +90,37 @@ services:
+     depends_on:
+       - control
+     volumes:
+-      - /home/labca/boulder_labca:/opt/boulder/labca
++      - boulder_data:/opt/boulder/labca
++      - certificates:/opt/boulder/labca/certs
+     networks:
+       consulnet:
+         ipv4_address: 10.55.55.10
+       bouldernet:
+         ipv4_address: 10.77.77.10
+     command: "consul agent -dev -config-format=hcl -config-file=/opt/boulder/labca/consul/config.hcl"
++    working_dir: /opt/boulder
+     restart: always
+ 
+   gui:
+-    image: *boulder_tools_image
++    image: ghcr.io/hakwerk/labca-gui:${LABCA_IMAGE_VERSION:-latest}
+     networks:
+       - bouldernet
+     volumes:
+       - /var/run/docker.sock:/var/run/docker.sock
+-      - /home/labca/admin:/go/src/labca
+-      - ./.gocache:/root/.cache/go-build
+-      - /home/labca/nginx_data/static:/var/www/html
+-      - /home/labca/backup:/opt/backup
+-      - .:/opt/boulder
+-      - /home/labca/boulder_labca:/opt/boulder/labca
+-      - /home/labca/boulder_labca/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/
++      - ./docker-compose.yml:/opt/boulder/docker-compose.yml
++      - ldata:/opt/labca/data
++      - nginx_html:/var/www/html
++      - backup:/opt/backup
++      - boulder_data:/opt/boulder/labca
++      - certificates:/opt/boulder/labca/certs
++      - softhsm:/var/lib/softhsm/tokens
+     expose:
+       - 3000
+     depends_on:
+       - bmysql
+       - control
+-    working_dir: /go/src/labca
+-    command: ./setup.sh
++    working_dir: /opt/labca
++    command: bin/labca-gui
+     logging:
+       driver: "json-file"
+       options:
+@@ -136,30 +137,28 @@ services:
+       - 80:80
+       - 443:443
+     volumes:
+-      - /home/labca/nginx_data/conf.d:/etc/nginx/conf.d
+-      - /home/labca/nginx_data/ssl:/etc/nginx/ssl
+-      - /home/labca/nginx_data/static:/var/www/html
++      - nginx_conf:/etc/nginx/conf.d
++      - nginx_ssl:/etc/nginx/ssl
++      - nginx_html:/var/www/html
+     depends_on:
+       - control
+ 
+   control:
+-    image: *boulder_tools_image
++    image: ghcr.io/hakwerk/labca-control:${LABCA_IMAGE_VERSION:-latest}
+     networks:
+       - bouldernet
+     volumes:
+       - /var/run/docker.sock:/var/run/docker.sock
+-      - /home/labca/admin/data:/opt/labca/data
+-      - /home/labca/admin/data:/opt/labca/gui/data
+-      - /home/labca/admin/bin:/opt/labca/bin
+-      - /home/labca/labca:/opt/labca
+-      - /home/labca/backup:/opt/backup
+-      - /home/labca/control_logs:/opt/logs
+-      - .:/opt/boulder
+-      - /home/labca/boulder_labca:/opt/boulder/labca
+-      - /home/labca/boulder_labca/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/
+-      - /home/labca/nginx_data/conf.d:/etc/nginx/conf.d
+-      - /home/labca/nginx_data/ssl:/etc/nginx/ssl
+-      - /home/labca/nginx_data/static:/var/www/html
++      - ./docker-compose.yml:/opt/boulder/docker-compose.yml
++      - ldata:/opt/labca/data
++      - backup:/opt/backup
++      - logs:/opt/logs
++      - boulder_data:/opt/boulder/labca
++      - certificates:/opt/boulder/labca/certs
++      - softhsm:/var/lib/softhsm/tokens
++      - nginx_conf:/etc/nginx/conf.d
++      - nginx_ssl:/etc/nginx/ssl
++      - nginx_html:/var/www/html
+     expose:
+       - 3030
+     environment:
+@@ -177,6 +176,15 @@ services:
+ 
+ volumes:
+   dbdata:
++  nginx_conf:
++  nginx_ssl:
++  nginx_html:
++  boulder_data:
++  ldata:
++  backup:
++  logs:
++  softhsm:
++  certificates:
+ 
+ networks:
+   # This network is primarily used for boulder services. It is also used by

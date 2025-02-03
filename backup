@@ -2,31 +2,39 @@
 
 set -e
 
-NOW=$(date +%y%m%d%H%M%S)
+NOW=$(date +%y%m%d-%H%M%S)
 CRON=""
 if [ "$1" == "cron" ]; then
-    CRON="${1}_"
+    CRON="_${1}"
+    TODAY=`date '+%Y_%m_%d'`
+    echo "Running cron-$(basename $0) for ${TODAY}..."
 fi
-BASE=${HOSTNAME}_${CRON}${NOW}
+instance=$(grep fqdn /opt/labca/data/config.json 2>/dev/null | cut -d ":" -f 2- | tr -d " \"," | cut -d"." -f1)
+BASE=${NOW}_${instance}${CRON}
 TMPDIR=/tmp/$BASE
 mkdir -p $TMPDIR
-mkdir -p /home/labca/backup
+mkdir -p /opt/backup
 
-cd /home/labca/boulder
-docker-compose exec -T bmysql mysqldump boulder_sa_integration >$TMPDIR/boulder_sa_integration.sql
+cd /opt/boulder
+docker compose exec bmysql mysqldump boulder_sa_integration >$TMPDIR/boulder_sa_integration.sql
 
 cp -p /etc/nginx/ssl/*key* /etc/nginx/ssl/*cert.pem /etc/nginx/ssl/*.csr $TMPDIR/
 
-cp -rp /home/labca/admin/data $TMPDIR/
+cp -rp /opt/labca/data $TMPDIR/
+#cp -p /opt/labca/data/config.json $TMPDIR/
+
+cp -rp /opt/boulder/labca/certs/webpki $TMPDIR/
+
+cp -rp /var/lib/softhsm/tokens $TMPDIR/
 
 
 cd /tmp
-tar czf /home/labca/backup/$BASE.tgz $BASE
+tar czf /opt/backup/$BASE.tgz $BASE
 rm -rf $TMPDIR
 
 # housekeeping
-find /home/labca/backup -name "*_cron_*.tgz" -mtime +31 -exec rm -rf {} \;
+find /opt/backup -name "*_cron_*.tgz" -mtime +31 -exec rm -rf {} \;
 
 if [ "$1" != "cron" ]; then
-    echo /home/labca/backup/$BASE.tgz
+    echo /opt/backup/$BASE.tgz
 fi

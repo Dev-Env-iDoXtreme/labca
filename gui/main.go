@@ -4,13 +4,38 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/x509"
+	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
+	"html/template"
+	"io"
+	"io/fs"
+	"log"
+	"math"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/biz/templates"
 	"github.com/dustin/go-humanize"
 	_ "github.com/go-sql-driver/mysql"
@@ -20,25 +45,10 @@ import (
 	"github.com/gorilla/sessions"
 	"github.com/gorilla/websocket"
 	"github.com/nbutton23/zxcvbn-go"
-	"github.com/theherk/viper"
+	"github.com/spf13/viper"
 	"golang.org/x/crypto/bcrypt"
-	"html/template"
-	"io"
-	"io/ioutil"
-	"log"
-	"math"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"reflect"
-	"regexp"
-	"runtime"
-	"runtime/debug"
-	"strconv"
-	"strings"
-	"time"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 const (
@@ -49,16 +59,26 @@ const (
 )
 
 var (
-	appSession      *sessions.Session
 	restartSecret   string
 	sessionStore    *sessions.CookieStore
 	tmpls           *templates.Templates
 	version         string
+	webTitle        string
 	dbConn          string
 	dbType          string
 	isDev           bool
 	updateAvailable bool
 	updateChecked   time.Time
+	srv             *http.Server
+	configPath      string
+	listenAddress   string
+
+	//go:embed templates
+	embeddedTemplates embed.FS
+	//go:embed static
+	staticFiles embed.FS
+	// Is set by the compiler using -ldflags
+	standaloneVersion string
 
 	upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -136,9 +156,9 @@ func (reg *User) Validate(isNew bool, isChange bool) bool {
 	}
 
 	if isNew || isChange {
-		re := regexp.MustCompile(".+@.+\\..+")
+		re := regexp.MustCompile(`.+@.+\..+`)
 		matched := re.Match([]byte(reg.Email))
-		if matched == false {
+		if !matched {
 			reg.Errors["Email"] = "Please enter a valid email address"
 		}
 	}
@@ -152,10 +172,12 @@ func (reg *User) Validate(isNew bool, isChange bool) bool {
 type SetupConfig struct {
 	Fqdn             string
 	Organization     string
+	WebTitle         string
 	DNS              string
 	DomainMode       string
 	LockdownDomains  string
 	WhitelistDomains string
+	LDPublicContacts bool
 	ExtendedTimeout  bool
 	RequestBase      string
 	Errors           map[string]string
@@ -185,31 +207,87 @@ func (cfg *SetupConfig) Validate(orgRequired bool) bool {
 		cfg.Errors["LockdownDomains"] = "Please enter one or more domains that this PKI host is locked down to"
 	}
 
+	if cfg.DomainMode == "lockdown" && strings.HasPrefix(cfg.LockdownDomains, ".") {
+		cfg.Errors["LockdownDomains"] = "Domain should not start with a dot"
+	}
+
 	if cfg.DomainMode == "whitelist" && strings.TrimSpace(cfg.WhitelistDomains) == "" {
 		cfg.Errors["WhitelistDomains"] = "Please enter one or more domains that are whitelisted for this PKI host"
+	}
+
+	if cfg.DomainMode == "whitelist" && strings.HasPrefix(cfg.WhitelistDomains, ".") {
+		cfg.Errors["WhitelistDomains"] = "Domain should not start with a dot"
 	}
 
 	return len(cfg.Errors) == 0
 }
 
-func getSession(w http.ResponseWriter, r *http.Request) *sessions.Session {
-	if appSession != nil {
-		return appSession
+// StandaloneConfig stores the config settings when running standalone.
+type StandaloneConfig struct {
+	Backend     string
+	MySQLServer string
+	MySQLPort   string
+	MySQLDBName string
+	MySQLUser   string
+	MySQLPasswd string
+	UseHTTPS    bool
+	CertPath    string
+	KeyPath     string
+	RequestBase string
+	Errors      map[string]string
+}
+
+// Validate that StandaloneConfig contains all required data.
+func (cfg *StandaloneConfig) Validate() bool {
+	cfg.Errors = make(map[string]string)
+
+	if strings.TrimSpace(cfg.Backend) != "step-ca" {
+		cfg.Errors["Backend"] = "Currently only step-ca is supported as backend"
 	}
 
-	session, err := sessionStore.Get(r, "labca")
-	if err != nil {
-		// Create new session
-		session = sessions.NewSession(sessionStore, "labca")
-		session.Save(r, w)
+	if strings.TrimSpace(cfg.MySQLServer) == "" {
+		cfg.Errors["MySQLServer"] = "Please enter the name or IP address of the MySQL server"
+	}
+	_, err := strconv.Atoi(string(strings.TrimSpace(cfg.MySQLServer)[0]))
+	if err == nil {
+		if ip := net.ParseIP(strings.TrimSpace(cfg.MySQLServer)); ip == nil {
+			cfg.Errors["MySQLServer"] = "Please enter a valid IP address"
+		}
 	}
 
-	appSession = session
-	return appSession
+	if strings.TrimSpace(cfg.MySQLPort) == "" {
+		cfg.Errors["MySQLPort"] = "Please enter the port number of the MySQL server"
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(cfg.MySQLPort))
+	if err != nil || p < 1 || p > 65535 {
+		cfg.Errors["MySQLPort"] = "Please enter a valid port number"
+	}
+
+	if strings.TrimSpace(cfg.MySQLDBName) == "" {
+		cfg.Errors["MySQLDBName"] = "Please enter the name of the MySQL database"
+	}
+
+	if strings.TrimSpace(cfg.MySQLUser) == "" {
+		cfg.Errors["MySQLUser"] = "Please enter the name of the MySQL user"
+	}
+
+	if strings.TrimSpace(cfg.MySQLPasswd) == "" {
+		cfg.Errors["MySQLPasswd"] = "Please enter the password of the MySQL user"
+	}
+
+	if cfg.UseHTTPS && strings.TrimSpace(cfg.CertPath) == "" {
+		cfg.Errors["CertPath"] = "Please enter the location and name of the HTTPS certificate to use"
+	}
+
+	if cfg.UseHTTPS && strings.TrimSpace(cfg.KeyPath) == "" {
+		cfg.Errors["KeyPath"] = "Please enter the location and name of the HTTPS key file to use"
+	}
+
+	return len(cfg.Errors) == 0
 }
 
 func errorHandler(w http.ResponseWriter, r *http.Request, err error, status int) {
-	log.Printf("errorHandler: %v", err)
+	log.Printf("errorHandler: err=%v\n", err)
 
 	w.WriteHeader(status)
 
@@ -233,8 +311,34 @@ func errorHandler(w http.ResponseWriter, r *http.Request, err error, status int)
 		}
 		fmt.Print(strings.Join(lines, "\n"))
 
-		render(w, r, "error", map[string]interface{}{"Message": "Some unexpected error occurred!"})
-		// TODO: send email eventually with info on the error
+		if viper.GetBool("config.complete") {
+			render(w, r, "error", map[string]interface{}{"Message": "Some unexpected error occurred!"})
+		} else {
+			// ONLY in the setup phase to prevent leaking too much details to users
+			var FileErrors []interface{}
+			data := getLog(w, r, "cert")
+			if data != "" {
+				FileErrors = append(FileErrors, map[string]interface{}{"FileName": "/home/labca/nginx_data/ssl/acme_tiny.log", "Content": data})
+			}
+			data = getLog(w, r, "commander")
+			if data != "" {
+				FileErrors = append(FileErrors, map[string]interface{}{"FileName": "(control)/logs/commander.log", "Content": data})
+			}
+			data = getLog(w, r, "control-notail")
+			if data != "" {
+				FileErrors = append(FileErrors, map[string]interface{}{"FileName": "docker compose logs control", "Content": data})
+			}
+			data = getLog(w, r, "boulder-notail")
+			if data != "" {
+				FileErrors = append(FileErrors, map[string]interface{}{"FileName": "docker compose logs boulder", "Content": data})
+			}
+			data = getLog(w, r, "labca-notail")
+			if data != "" {
+				FileErrors = append(FileErrors, map[string]interface{}{"FileName": "docker compose logs labca", "Content": data})
+			}
+
+			render(w, r, "error", map[string]interface{}{"Message": "Some unexpected error occurred!", "FileErrors": FileErrors})
+		}
 	}
 }
 
@@ -259,7 +363,7 @@ func checkUpdates(forced bool) ([]string, []string) {
 						if *release.Name == version {
 							newer = false
 						}
-						if strings.HasPrefix(version, *release.Name + "-") {    // git describe format
+						if latest == *release.Name && strings.HasPrefix(version, *release.Name+"-") { // git describe format
 							newer = false
 							latest = version
 						}
@@ -287,8 +391,12 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 	dashboardData, err := CollectDashboardData(w, r)
 	if err == nil {
-		checkUpdates(false)
-		dashboardData["UpdateAvailable"] = updateAvailable
+		if viper.GetBool("standalone") {
+			dashboardData["UpdateAvailable"] = false
+		} else {
+			checkUpdates(false)
+			dashboardData["UpdateAvailable"] = updateAvailable
+		}
 		dashboardData["UpdateChecked"] = strings.Replace(updateChecked.Format("02-Jan-2006 15:04:05 MST"), "+0000", "GMT", -1)
 		dashboardData["UpdateCheckedRel"] = humanize.RelTime(updateChecked, time.Now(), "", "")
 
@@ -298,7 +406,8 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 func aboutHandler(w http.ResponseWriter, r *http.Request) {
 	render(w, r, "about", map[string]interface{}{
-		"Title": "About",
+		"Title":      "About",
+		"Standalone": viper.GetBool("standalone"),
 	})
 }
 
@@ -308,7 +417,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := getSession(w, r)
+	session, _ := sessionStore.Get(r, "labca")
 	var bounceURL string
 	if session.Values["bounce"] == nil {
 		bounceURL = "/"
@@ -339,7 +448,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			RequestBase: r.Header.Get("X-Request-Base"),
 		}
 
-		if reg.Validate(false, false) == false {
+		if !reg.Validate(false, false) {
 			render(w, r, "login", map[string]interface{}{"User": reg, "IsLogin": true})
 			return
 		}
@@ -360,7 +469,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		session.Values["user"] = reg.Name
-		session.Save(r, w)
+		if err = session.Save(r, w); err != nil {
+			log.Printf("cannot save session: %s\n", err)
+		}
 
 		http.Redirect(w, r, r.Header.Get("X-Request-Base")+bounceURL, http.StatusFound)
 	} else {
@@ -370,7 +481,11 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	appSession = nil
+	session, _ := sessionStore.Get(r, "labca")
+	session.Options.MaxAge = -1
+	if err := session.Save(r, w); err != nil {
+		log.Printf("cannot save session: %s\n", err)
+	}
 	http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/", http.StatusFound)
 }
 
@@ -384,6 +499,8 @@ func _sendCmdOutput(w http.ResponseWriter, r *http.Request, cmd string) {
 
 	out, err := exec.Command(head, parts...).Output()
 	if err != nil {
+		fmt.Println(err)
+		fmt.Println(out)
 		errorHandler(w, r, err, http.StatusInternalServerError)
 		return
 	}
@@ -408,9 +525,14 @@ func _backupHandler(w http.ResponseWriter, r *http.Request) {
 		if !_hostCommand(w, r, action, backup) {
 			res.Success = false
 			res.Message = "Command failed - see LabCA log for any details"
+		} else {
+			defer func() {
+				_hostCommand(w, r, "server-restart")
+				if _, err := exeCmd("./restart_control"); err != nil {
+					log.Printf("_backupHandler: error restarting control container: %v", err)
+				}
+			}()
 		}
-
-		defer _hostCommand(w, r, "server-restart")
 	} else if action == "backup-delete" {
 		backup := r.Form.Get("backup")
 		if !_hostCommand(w, r, action, backup) {
@@ -425,10 +547,49 @@ func _backupHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			res.Message = filepath.Base(res.Message)
 		}
+	} else if action == "backup-upload" {
+		file, header, err := r.FormFile("backup-file")
+		if err != nil {
+			fmt.Println(err)
+			res.Success = false
+			res.Message = "Could not read uploaded file"
+		}
+		var out *os.File
+		if res.Success {
+			defer file.Close()
+
+			out, err = os.Create("/opt/backup/" + header.Filename)
+			if err != nil {
+				fmt.Println(err)
+				res.Success = false
+				res.Message = "Could not create backup file on server"
+			}
+		}
+		if res.Success {
+			defer out.Close()
+
+			_, copyError := io.Copy(out, file)
+			if copyError != nil {
+				fmt.Println(err)
+				res.Success = false
+				res.Message = "Could not store uploaded file"
+			} else {
+				res.Message = header.Filename
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
+}
+
+type ErrorsResponse struct {
+	Success bool
+	Errors  map[string]string
+}
+
+func makeErrorsResponse(success bool) ErrorsResponse {
+	return ErrorsResponse{Success: success, Errors: make(map[string]string)}
 }
 
 func _accountUpdateHandler(w http.ResponseWriter, r *http.Request) {
@@ -440,10 +601,7 @@ func _accountUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		Password:    r.Form.Get("password"),
 	}
 
-	res := struct {
-		Success bool
-		Errors  map[string]string
-	}{Success: true}
+	res := makeErrorsResponse(true)
 
 	if reg.Validate(false, true) {
 		viper.Set("user.name", reg.Name)
@@ -459,7 +617,11 @@ func _accountUpdateHandler(w http.ResponseWriter, r *http.Request) {
 			viper.Set("user.password", string(hash))
 
 			// Forget current session, so user has to login with the new password
-			appSession = nil
+			session, _ := sessionStore.Get(r, "labca")
+			session.Options.MaxAge = -1
+			if err = session.Save(r, w); err != nil {
+				log.Printf("cannot save session: %s\n", err)
+			}
 		}
 
 		viper.WriteConfig()
@@ -473,33 +635,66 @@ func _accountUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+func backendUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	cfg := &StandaloneConfig{
+		Backend:     r.Form.Get("backend"),
+		MySQLServer: r.Form.Get("mysql_server"),
+		MySQLPort:   r.Form.Get("mysql_port"),
+		MySQLDBName: r.Form.Get("mysql_dbname"),
+		MySQLUser:   r.Form.Get("mysql_user"),
+		MySQLPasswd: r.Form.Get("mysql_passwd"),
+		UseHTTPS:    (r.Form.Get("use_https") == "https"),
+		CertPath:    r.Form.Get("cert_path"),
+		KeyPath:     r.Form.Get("key_path"),
+		RequestBase: r.Header.Get("X-Request-Base"),
+	}
+
+	res := makeErrorsResponse(true)
+
+	if cfg.Validate() {
+		writeStandaloneConfig(cfg)
+	} else {
+		res.Success = false
+		res.Errors = cfg.Errors
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
 func _configUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	cfg := &SetupConfig{
 		Fqdn:             r.Form.Get("fqdn"),
 		Organization:     r.Form.Get("organization"),
+		WebTitle:         r.Form.Get("webtitle"),
 		DNS:              r.Form.Get("dns"),
 		DomainMode:       r.Form.Get("domain_mode"),
 		LockdownDomains:  r.Form.Get("lockdown_domains"),
 		WhitelistDomains: r.Form.Get("whitelist_domains"),
+		LDPublicContacts: (r.Form.Get("ld_public_contacts") == "true"),
 		ExtendedTimeout:  (r.Form.Get("extended_timeout") == "true"),
 	}
 
-	res := struct {
-		Success bool
-		Errors  map[string]string
-	}{Success: true}
+	res := makeErrorsResponse(true)
 
 	if cfg.Validate(true) {
 		delta := false
+		deltaFQDN := false
 
 		if cfg.Fqdn != viper.GetString("labca.fqdn") {
 			delta = true
+			deltaFQDN = true
 			viper.Set("labca.fqdn", cfg.Fqdn)
 		}
 
 		if cfg.Organization != viper.GetString("labca.organization") {
 			delta = true
 			viper.Set("labca.organization", cfg.Organization)
+		}
+
+		if cfg.WebTitle != viper.GetString("labca.web_title") {
+			delta = true
+			viper.Set("labca.web_title", cfg.WebTitle)
 		}
 
 		matched, err := regexp.MatchString(":\\d+$", cfg.DNS)
@@ -523,6 +718,11 @@ func _configUpdateHandler(w http.ResponseWriter, r *http.Request) {
 				delta = true
 				viper.Set("labca.lockdown", cfg.LockdownDomains)
 			}
+
+			if cfg.LDPublicContacts != viper.GetBool("labca.ld_public_contacts") {
+				delta = true
+				viper.Set("labca.ld_public_contacts", cfg.LDPublicContacts)
+			}
 		}
 		if domainMode == "whitelist" {
 			if cfg.WhitelistDomains != viper.GetString("labca.whitelist") {
@@ -540,11 +740,22 @@ func _configUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		if delta {
 			viper.WriteConfig()
 
+			webTitle = viper.GetString("labca.web_title")
+			if webTitle == "" {
+				webTitle = "LabCA"
+			}
+
 			err := _applyConfig()
 			if err != nil {
 				res.Success = false
 				res.Errors = cfg.Errors
 				res.Errors["ConfigUpdate"] = "Config apply error: '" + err.Error() + "'"
+			} else if deltaFQDN {
+				if !_hostCommand(w, r, "acme-change", viper.GetString("labca.fqdn")) {
+					res.Success = false
+					res.Errors = cfg.Errors
+					res.Errors["ConfigUpdate"] = "Error requesting certificate for new fqdn"
+				}
 			}
 		} else {
 			res.Success = false
@@ -561,6 +772,45 @@ func _configUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+func _crlIntervalUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	res := makeErrorsResponse(true)
+
+	delta := false
+	crlInterval := r.Form.Get("crl_interval")
+
+	ci, err := time.ParseDuration(crlInterval)
+	if err != nil {
+		res.Success = false
+		res.Errors["CRLInterval"] = "Could not parse duration"
+	} else {
+		back := 4 * ci
+		crlInterval += "|" + back.String()
+		if crlInterval != viper.GetString("crl_interval") {
+			delta = true
+			viper.Set("crl_interval", crlInterval)
+		}
+
+		if delta {
+			viper.WriteConfig()
+
+			err := _applyConfig()
+			if err != nil {
+				res.Success = false
+				res.Errors["CRLInterval"] = "Config apply error: '" + err.Error() + "'"
+			} else if !_hostCommand(w, r, "boulder-restart") {
+				res.Success = false
+				res.Errors["CRLInterval"] = "Error restarting Boulder (ACME)"
+			}
+		} else {
+			res.Success = false
+			res.Errors["CRLInterval"] = "Nothing changed!"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
 // EmailConfig stores configuration used for sending out emails
 type EmailConfig struct {
 	DoEmail   bool
@@ -569,6 +819,7 @@ type EmailConfig struct {
 	EmailUser string
 	EmailPwd  []byte
 	From      string
+	TrustRoot string
 	Errors    map[string]string
 }
 
@@ -583,7 +834,7 @@ func (cfg *EmailConfig) Validate() bool {
 		cfg.Errors["EmailPwd"] = "Could not encrypt this password: " + err.Error()
 	}
 
-	if cfg.DoEmail == false {
+	if !cfg.DoEmail {
 		return len(cfg.Errors) == 0
 	}
 
@@ -620,6 +871,10 @@ func (cfg *EmailConfig) Validate() bool {
 		cfg.Errors["From"] = "Please enter the from email address"
 	}
 
+	if strings.TrimSpace(cfg.TrustRoot) == "" {
+		cfg.Errors["From"] = "Please select what root CA to trust for validating the email server certificate"
+	}
+
 	return len(cfg.Errors) == 0
 }
 
@@ -631,12 +886,10 @@ func _emailUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		EmailUser: r.Form.Get("email_user"),
 		EmailPwd:  []byte(r.Form.Get("email_pwd")),
 		From:      r.Form.Get("from"),
+		TrustRoot: r.Form.Get("trust_root"),
 	}
 
-	res := struct {
-		Success bool
-		Errors  map[string]string
-	}{Success: true}
+	res := makeErrorsResponse(true)
 
 	if cfg.Validate() {
 		delta := false
@@ -679,6 +932,11 @@ func _emailUpdateHandler(w http.ResponseWriter, r *http.Request) {
 			viper.Set("labca.email.from", cfg.From)
 		}
 
+		if cfg.TrustRoot != viper.GetString("labca.email.trust_root") {
+			delta = true
+			viper.Set("labca.email.trust_root", cfg.TrustRoot)
+		}
+
 		if delta {
 			viper.WriteConfig()
 
@@ -704,65 +962,87 @@ func _emailUpdateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func _emailSendHandler(w http.ResponseWriter, r *http.Request) {
-	res := struct {
-		Success bool
-		Errors  map[string]string
-	}{Success: true, Errors: make(map[string]string)}
+	res := makeErrorsResponse(true)
 
 	recipient := viper.GetString("user.email")
-	if !_hostCommand(w, r, "test-email", recipient) {
-		res.Success = false
-		res.Errors["EmailSend"] = "Failed to send email - see logs"
+	if _hostCommand(w, r, "test-email", recipient) {
+		// Only on success, as when this returns false for this case the response has already been sent!
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
 }
 
 func _exportHandler(w http.ResponseWriter, r *http.Request) {
-	basename := "certificates"
-	if r.Form.Get("root") != "true" {
-		basename = "issuer"
+	certname := r.Form.Get("certname")
+	certFile := fmt.Sprintf("%s%s.pem", CERT_FILES_PATH, certname)
+
+	seqnr := ""
+	re := regexp.MustCompile(`-(\d{2})-`)
+	match := re.FindStringSubmatch(certname)
+	if len(match) > 1 {
+		seqnr = match[1]
+	} else {
+		errorHandler(w, r, fmt.Errorf("failed to extract sequence number from filename '%s'", certFile), http.StatusInternalServerError)
+		return
 	}
-	if r.Form.Get("issuer") != "true" {
-		basename = "root"
+
+	cfg := &HSMConfig{}
+	if strings.HasPrefix(certname, "root-") {
+		cfg.Initialize("root", seqnr)
+	}
+	if strings.HasPrefix(certname, "issuer-") {
+		cfg.Initialize("issuer", seqnr)
+	}
+
+	key, err := cfg.GetPrivateKey()
+	if err != nil {
+		fmt.Println(err)
+		if strings.Contains(err.Error(), "CKR_KEY_UNEXTRACTABLE") {
+			errorHandler(w, r, err, http.StatusBadRequest)
+		} else {
+			errorHandler(w, r, err, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	tmpDir, err := os.MkdirTemp("", "labca")
+	if err != nil {
+		fmt.Println(err)
+		errorHandler(w, r, err, http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	keyFile := path.Join(tmpDir, fmt.Sprintf("%s.pem", strings.Replace(certname, "-cert", "-key", -1)))
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})
+	err = os.WriteFile(keyFile, keyPEM, os.ModeAppend)
+	if err != nil {
+		fmt.Println(err)
+		errorHandler(w, r, err, http.StatusInternalServerError)
+		return
 	}
 
 	if r.Form.Get("type") == "pfx" {
 		w.Header().Set("Content-Type", "application/x-pkcs12")
-		w.Header().Set("Content-Disposition", "attachment; filename=labca_"+basename+".pfx")
+		w.Header().Set("Content-Disposition", "attachment; filename=labca-"+certname+".pfx")
 
-		var certBase string
-		if basename == "root" {
-			certBase = "data/root-ca"
-		} else {
-			certBase = "data/issuer/ca-int"
-		}
-
-		cmd := "openssl pkcs12 -export -inkey " + certBase + ".key -in " + certBase + ".pem -passout pass:" + r.Form.Get("export-pwd")
+		cmd := "openssl pkcs12 -export -inkey " + keyFile + " -in " + certFile + " -passout pass:" + r.Form.Get("export-pwd")
 
 		_sendCmdOutput(w, r, cmd)
 	}
 
 	if r.Form.Get("type") == "zip" {
 		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", "attachment; filename=labca_"+basename+".zip")
+		w.Header().Set("Content-Disposition", "attachment; filename=labca-"+certname+".zip")
 
-		cmd := "zip -j -P " + r.Form.Get("export-pwd") + " - "
-		var certBase string
-		if r.Form.Get("root") == "true" {
-			certBase = "data/root-ca"
-			cmd = cmd + certBase + ".key " + certBase + ".pem "
-		}
-		if r.Form.Get("issuer") == "true" {
-			certBase = "data/issuer/ca-int"
-			cmd = cmd + certBase + ".key " + certBase + ".pem "
-		}
+		cmd := "zip -j -P " + r.Form.Get("export-pwd") + " - " + keyFile + " " + certFile
 
 		_sendCmdOutput(w, r, cmd)
 	}
 }
 
+/*
 func _doCmdOutput(w http.ResponseWriter, r *http.Request, cmd string) string {
 	parts := strings.Fields(cmd)
 	for i := 0; i < len(parts); i++ {
@@ -779,6 +1059,7 @@ func _doCmdOutput(w http.ResponseWriter, r *http.Request, cmd string) string {
 
 	return string(out)
 }
+*/
 
 func _encrypt(plaintext []byte) (string, error) {
 	key := []byte(viper.GetString("keys.enc"))
@@ -839,9 +1120,12 @@ func (res *Result) ManageComponents(w http.ResponseWriter, r *http.Request, acti
 	components := _parseComponents(getLog(w, r, "components"))
 	for i := 0; i < len(components); i++ {
 		if (components[i].Name == "NGINX Webserver" && (action == "nginx-reload" || action == "nginx-restart")) ||
-			(components[i].Name == "Host Service" && action == "svc-restart") ||
+			(components[i].Name == "LabCA Controller" && action == "svc-restart") ||
 			(components[i].Name == "Boulder (ACME)" && (action == "boulder-start" || action == "boulder-stop" || action == "boulder-restart")) ||
-			(components[i].Name == "LabCA Application" && action == "labca-restart") {
+			(components[i].Name == "LabCA Application" && action == "labca-restart") ||
+			(components[i].Name == "Consul (Boulder)" && action == "consul-restart") ||
+			(components[i].Name == "pkilint (Boulder)" && action == "pkilint-restart") ||
+			(components[i].Name == "MySQL Database" && action == "mysql-restart") {
 			res.Timestamp = components[i].Timestamp
 			res.TimestampRel = components[i].TimestampRel
 			res.Class = components[i].Class
@@ -850,7 +1134,7 @@ func (res *Result) ManageComponents(w http.ResponseWriter, r *http.Request, acti
 	}
 }
 
-func _checkUpdatesHandler(w http.ResponseWriter, r *http.Request) {
+func _checkUpdatesHandler(w http.ResponseWriter, _ *http.Request) {
 	res := struct {
 		Success          bool
 		UpdateAvailable  bool
@@ -871,8 +1155,100 @@ func _checkUpdatesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+func generateCRLHandler(w http.ResponseWriter, r *http.Request, isRoot bool) {
+	res := makeErrorsResponse(true)
+
+	command := "gen-issuer-crl"
+	if isRoot {
+		command = "gen-root-crl"
+	}
+
+	if !_hostCommand(w, r, command) {
+		res.Success = false
+		res.Errors["CRL"] = "Failed to generate CRL - see logs"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+func uploadCRLHandler(w http.ResponseWriter, r *http.Request) {
+	res := makeErrorsResponse(true)
+
+	rootci := &CertificateInfo{
+		IsRoot: true,
+		CRL:    r.Form.Get("crl"),
+	}
+	if !rootci.StoreCRL("data/") {
+		res.Success = false
+		res.Errors["CRL"] = rootci.Errors["Modal"]
+	}
+
+	_hostCommand(w, r, "check-crl")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+func updateLeaveIssuersHandler(w http.ResponseWriter, r *http.Request) {
+	res := struct {
+		Success bool
+		Error   string
+	}{Success: true}
+
+	if err := setUseForLeaves(r.Form.Get("active")); err != nil {
+		res.Success = false
+		res.Error = err.Error()
+	} else {
+		defer func() {
+			if !_hostCommand(w, r, "boulder-restart") {
+				log.Printf("updateLeaveIssuersHandler: error restarting boulder: %v", err)
+			}
+		}()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+func renewCertHandler(w http.ResponseWriter, r *http.Request) {
+	res := struct {
+		Success bool
+		Error   string
+	}{Success: true}
+
+	days, err := strconv.Atoi(r.Form.Get("days"))
+	if err != nil {
+		fmt.Printf("'%v' is not a number", r.Form.Get("days"))
+		errorHandler(w, r, err, http.StatusBadRequest)
+		return
+	}
+
+	if err := renewCertificate(r.Form.Get("certname"), days, r.Form.Get("rootname"), r.Form.Get("root_key"), r.Form.Get("passphrase")); err != nil {
+		res.Success = false
+		res.Error = err.Error()
+	} else {
+		ex, _ := os.Executable()
+		exePath := filepath.Dir(ex)
+		path, _ := filepath.Abs(exePath + "/..")
+		if _, err := exeCmd(path + "/apply"); err != nil {
+			fmt.Println(err)
+			res.Success = false
+			res.Error = "Could not apply: " + err.Error()
+		}
+
+		if !_hostCommand(w, r, "boulder-restart") {
+			res.Success = false
+			res.Error = "Error restarting Boulder (ACME)"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
 func _managePostDispatch(w http.ResponseWriter, r *http.Request, action string) bool {
-	if action == "backup-restore" || action == "backup-delete" || action == "backup-now" {
+	if action == "backup-restore" || action == "backup-delete" || action == "backup-now" || action == "backup-upload" {
 		_backupHandler(w, r)
 		return true
 	}
@@ -887,8 +1263,18 @@ func _managePostDispatch(w http.ResponseWriter, r *http.Request, action string) 
 		return true
 	}
 
+	if action == "update-backend" {
+		backendUpdateHandler(w, r)
+		return true
+	}
+
 	if action == "update-config" {
 		_configUpdateHandler(w, r)
+		return true
+	}
+
+	if action == "update-crl-interval" {
+		_crlIntervalUpdateHandler(w, r)
 		return true
 	}
 
@@ -907,6 +1293,38 @@ func _managePostDispatch(w http.ResponseWriter, r *http.Request, action string) 
 		return true
 	}
 
+	if action == "upload-root-crl" {
+		uploadCRLHandler(w, r)
+		return true
+	}
+
+	if action == "gen-root-crl" {
+		generateCRLHandler(w, r, true)
+		return true
+	}
+
+	if action == "gen-issuer-crl" {
+		generateCRLHandler(w, r, false)
+		return true
+	}
+
+	if action == "update-leave-issuers" {
+		updateLeaveIssuersHandler(w, r)
+		return true
+	}
+
+	if action == "renew-cert" {
+		renewCertHandler(w, r)
+		return true
+	}
+
+	if action == "svc-restart" {
+		if _, err := exeCmd("./restart_control"); err != nil {
+			log.Printf("_managePostDispatch: error restarting control container: %v", err)
+		}
+		return true
+	}
+
 	return false
 }
 
@@ -917,12 +1335,24 @@ func _managePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	action := r.Form.Get("action")
+	if action == "" {
+		if err := r.ParseMultipartForm(2 * 1024 * 1024); err != nil {
+			errorHandler(w, r, err, http.StatusInternalServerError)
+			return
+		}
+		action = r.Form.Get("action")
+	}
+
 	actionKnown := false
 	for _, a := range []string{
 		"backup-restore",
 		"backup-delete",
 		"backup-now",
+		"backup-upload",
 		"cert-export",
+		"mysql-restart",
+		"consul-restart",
+		"pkilint-restart",
 		"nginx-reload",
 		"nginx-restart",
 		"svc-restart",
@@ -931,20 +1361,26 @@ func _managePost(w http.ResponseWriter, r *http.Request) {
 		"boulder-restart",
 		"labca-restart",
 		"server-restart",
-		"server-shutdown",
 		"update-account",
+		"update-backend",
 		"update-config",
+		"update-crl-interval",
 		"update-email",
 		"send-email",
 		"version-check",
 		"version-update",
+		"upload-root-crl",
+		"gen-root-crl",
+		"gen-issuer-crl",
+		"update-leave-issuers",
+		"renew-cert",
 	} {
 		if a == action {
 			actionKnown = true
 		}
 	}
 	if !actionKnown {
-		errorHandler(w, r, fmt.Errorf("Unknown manage action '%s'", action), http.StatusBadRequest)
+		errorHandler(w, r, fmt.Errorf("unknown manage action '%s'", action), http.StatusBadRequest)
 		return
 	}
 
@@ -953,13 +1389,15 @@ func _managePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res := &Result{Success: true}
-	if !_hostCommand(w, r, action) {
-		res.Success = false
-		res.Message = "Command failed - see LabCA log for any details"
-	}
+	if !viper.GetBool("standalone") {
+		if !_hostCommand(w, r, action) {
+			res.Success = false
+			res.Message = "Command failed - see LabCA log for any details"
+		}
 
-	if action != "server-restart" && action != "server-shutdown" && action != "version-update" {
-		res.ManageComponents(w, r, action)
+		if action != "server-restart" && action != "version-update" {
+			res.ManageComponents(w, r, action)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -970,143 +1408,225 @@ func _manageGet(w http.ResponseWriter, r *http.Request) {
 	manageData := make(map[string]interface{})
 	manageData["RequestBase"] = r.Header.Get("X-Request-Base")
 
-	checkUpdates(false)
-	manageData["UpdateAvailable"] = updateAvailable
-	manageData["UpdateChecked"] = strings.Replace(updateChecked.Format("02-Jan-2006 15:04:05 MST"), "+0000", "GMT", -1)
-	manageData["UpdateCheckedRel"] = humanize.RelTime(updateChecked, time.Now(), "", "")
+	if viper.GetBool("standalone") {
+		manageData["Standalone"] = true
+		manageData["Backend"] = viper.GetString("backend")
 
-	components := _parseComponents(getLog(w, r, "components"))
-	for i := 0; i < len(components); i++ {
-		if components[i].Name == "NGINX Webserver" {
-			components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/weberr"
-			components[i].LogTitle = "Web Error Log"
-
-			btn := make(map[string]interface{})
-			btn["Class"] = "btn-info"
-			btn["Id"] = "nginx-reload"
-			btn["Title"] = "Reload web server configuration with minimal impact to the users"
-			btn["Label"] = "Reload"
-			components[i].Buttons = append(components[i].Buttons, btn)
-
-			btn = make(map[string]interface{})
-			btn["Class"] = "btn-warning"
-			btn["Id"] = "nginx-restart"
-			btn["Title"] = "Restart the web server with some downtime for the users"
-			btn["Label"] = "Restart"
-			components[i].Buttons = append(components[i].Buttons, btn)
-		}
-
-		if components[i].Name == "Host Service" {
-			components[i].LogURL = ""
-			components[i].LogTitle = ""
-
-			btn := make(map[string]interface{})
-			btn["Class"] = "btn-warning"
-			btn["Id"] = "svc-restart"
-			btn["Title"] = "Restart the host service"
-			btn["Label"] = "Restart"
-			components[i].Buttons = append(components[i].Buttons, btn)
-		}
-
-		if components[i].Name == "Boulder (ACME)" {
-			components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/boulder"
-			components[i].LogTitle = "ACME Log"
-
-			btn := make(map[string]interface{})
-			cls := "btn-success"
-			if components[i].TimestampRel != "stopped" {
-				cls = cls + " hidden"
+		dsn := strings.Split(viper.GetString("db.conn"), "@")
+		if len(dsn) > 0 {
+			up := strings.Split(dsn[0], ":")
+			if len(up) > 0 {
+				manageData["MySQLUser"] = up[0]
 			}
-			btn["Class"] = cls
-			btn["Id"] = "boulder-start"
-			btn["Title"] = "Start the core ACME application"
-			btn["Label"] = "Start"
-			components[i].Buttons = append(components[i].Buttons, btn)
-
-			btn = make(map[string]interface{})
-			cls = "btn-warning"
-			if components[i].TimestampRel == "stopped" {
-				cls = cls + " hidden"
+			if len(up) > 1 {
+				manageData["MySQLPasswd"] = up[1]
 			}
-			btn["Class"] = cls
-			btn["Id"] = "boulder-restart"
-			btn["Title"] = "Stop and restart the core ACME application"
-			btn["Label"] = "Restart"
-			components[i].Buttons = append(components[i].Buttons, btn)
-
-			btn = make(map[string]interface{})
-			cls = "btn-danger"
-			if components[i].TimestampRel == "stopped" {
-				cls = cls + " hidden"
+		}
+		if len(dsn) > 1 {
+			sd := strings.Split(dsn[1], "/")
+			if len(sd) > 0 {
+				if strings.HasPrefix(sd[0], "tcp(") {
+					sd[0] = sd[0][4 : len(sd[0])-1]
+				}
+				sp := strings.Split(sd[0], ":")
+				if len(sp) > 0 {
+					manageData["MySQLServer"] = sp[0]
+				}
+				if len(sp) > 1 {
+					manageData["MySQLPort"] = sp[1]
+				}
 			}
-			btn["Class"] = cls
-			btn["Id"] = "boulder-stop"
-			btn["Title"] = "Stop the core ACME application; users can no longer use ACME clients to interact with this instance"
-			btn["Label"] = "Stop"
-			components[i].Buttons = append(components[i].Buttons, btn)
+			if len(sd) > 1 {
+				manageData["MySQLDBName"] = sd[1]
+			}
 		}
 
-		if components[i].Name == "LabCA Application" {
-			components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/labca"
-			components[i].LogTitle = "LabCA Log"
+		manageData["UseHTTPS"] = viper.GetBool("server.https")
+		manageData["CertPath"] = viper.GetString("server.cert")
+		manageData["KeyPath"] = viper.GetString("server.key")
 
-			btn := make(map[string]interface{})
-			btn["Class"] = "btn-warning"
-			btn["Id"] = "labca-restart"
-			btn["Title"] = "Stop and restart this LabCA admin application"
-			btn["Label"] = "Restart"
-			components[i].Buttons = append(components[i].Buttons, btn)
+	} else {
+		checkUpdates(false)
+		manageData["UpdateAvailable"] = updateAvailable
+		manageData["UpdateChecked"] = strings.Replace(updateChecked.Format("02-Jan-2006 15:04:05 MST"), "+0000", "GMT", -1)
+		manageData["UpdateCheckedRel"] = humanize.RelTime(updateChecked, time.Now(), "", "")
+
+		components := _parseComponents(getLog(w, r, "components"))
+		for i := 0; i < len(components); i++ {
+			if components[i].Name == "Boulder (ACME)" {
+				components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/boulder"
+				components[i].LogTitle = "ACME Log"
+
+				btn := make(map[string]interface{})
+				cls := "btn-success"
+				if components[i].TimestampRel != "stopped" {
+					cls = cls + " hidden"
+				}
+				btn["Class"] = cls
+				btn["Id"] = "boulder-start"
+				btn["Title"] = "Start the core ACME application"
+				btn["Label"] = "Start"
+				components[i].Buttons = append(components[i].Buttons, btn)
+
+				btn = make(map[string]interface{})
+				cls = "btn-warning"
+				if components[i].TimestampRel == "stopped" {
+					cls = cls + " hidden"
+				}
+				btn["Class"] = cls
+				btn["Id"] = "boulder-restart"
+				btn["Title"] = "Stop and restart the core ACME application"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+
+				btn = make(map[string]interface{})
+				cls = "btn-danger"
+				if components[i].TimestampRel == "stopped" {
+					cls = cls + " hidden"
+				}
+				btn["Class"] = cls
+				btn["Id"] = "boulder-stop"
+				btn["Title"] = "Stop the core ACME application; users can no longer use ACME clients to interact with this instance"
+				btn["Label"] = "Stop"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "LabCA Controller" {
+				components[i].LogURL = ""
+				components[i].LogTitle = ""
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "svc-restart"
+				btn["Title"] = "Restart the host service"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "LabCA Application" {
+				components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/labca"
+				components[i].LogTitle = "LabCA Log"
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "labca-restart"
+				btn["Title"] = "Stop and restart this LabCA admin application"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "NGINX Webserver" {
+				components[i].LogURL = r.Header.Get("X-Request-Base") + "/logs/web"
+				components[i].LogTitle = "Web Error Log"
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-info"
+				btn["Id"] = "nginx-reload"
+				btn["Title"] = "Reload web server configuration with minimal impact to the users"
+				btn["Label"] = "Reload"
+				components[i].Buttons = append(components[i].Buttons, btn)
+
+				btn = make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "nginx-restart"
+				btn["Title"] = "Restart the web server with some downtime for the users"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "Consul (Boulder)" {
+				components[i].LogURL = ""
+				components[i].LogTitle = ""
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "consul-restart"
+				btn["Title"] = "Restart the Consul internal DNS helper"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "pkilint (Boulder)" {
+				components[i].LogURL = ""
+				components[i].LogTitle = ""
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "pkilint-restart"
+				btn["Title"] = "Restart the internal pkilint helper"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
+
+			if components[i].Name == "MySQL Database" {
+				components[i].LogURL = ""
+				components[i].LogTitle = ""
+
+				btn := make(map[string]interface{})
+				btn["Class"] = "btn-warning"
+				btn["Id"] = "mysql-restart"
+				btn["Title"] = "Restart the MySQL database server"
+				btn["Label"] = "Restart"
+				components[i].Buttons = append(components[i].Buttons, btn)
+			}
 		}
-	}
-	manageData["Components"] = components
+		manageData["Components"] = components
 
-	stats := _parseStats(getLog(w, r, "stats"))
-	for _, stat := range stats {
-		if stat.Name == "System Uptime" {
-			manageData["ServerTimestamp"] = stat.Hint
-			manageData["ServerTimestampRel"] = stat.Value
-			break
-		}
-	}
+		backupFiles := strings.Split(getLog(w, r, "backups"), "\n")
+		backupFiles = backupFiles[:len(backupFiles)-1]
+		manageData["BackupFiles"] = backupFiles
 
-	backupFiles := strings.Split(getLog(w, r, "backups"), "\n")
-	backupFiles = backupFiles[:len(backupFiles)-1]
-	manageData["BackupFiles"] = backupFiles
+		chains := getChains()
+		manageData["CertificateChains"] = chains
 
-	manageData["RootDetails"] = _doCmdOutput(w, r, "openssl x509 -noout -text -in data/root-ca.pem")
-	manageData["IssuerDetails"] = _doCmdOutput(w, r, "openssl x509 -noout -text -in data/issuer/ca-int.pem")
-
-	manageData["Fqdn"] = viper.GetString("labca.fqdn")
-	manageData["Organization"] = viper.GetString("labca.organization")
-	manageData["DNS"] = viper.GetString("labca.dns")
-	domainMode := viper.GetString("labca.domain_mode")
-	manageData["DomainMode"] = domainMode
-	if domainMode == "lockdown" {
-		manageData["LockdownDomains"] = viper.GetString("labca.lockdown")
-	}
-	if domainMode == "whitelist" {
-		manageData["WhitelistDomains"] = viper.GetString("labca.whitelist")
-	}
-	manageData["ExtendedTimeout"] = viper.GetBool("labca.extended_timeout")
-
-	manageData["DoEmail"] = viper.GetBool("labca.email.enable")
-	manageData["Server"] = viper.GetString("labca.email.server")
-	manageData["Port"] = viper.GetInt("labca.email.port")
-	manageData["EmailUser"] = viper.GetString("labca.email.user")
-	manageData["EmailPwd"] = ""
-	if viper.Get("labca.email.pass") != nil {
-		pwd := viper.GetString("labca.email.pass")
-		result, err := _decrypt(pwd)
-		if err == nil {
-			manageData["EmailPwd"] = string(result)
+		if viper.Get("crl_interval") == nil || viper.GetString("crl_interval") == "" {
+			manageData["CRLInterval"] = "24h"
 		} else {
-			log.Printf("WARNING: could not decrypt email password: %s!\n", err.Error())
+			ci := strings.Split(viper.GetString("crl_interval"), "|")
+			manageData["CRLInterval"] = ci[0]
 		}
+
+		manageData["Fqdn"] = viper.GetString("labca.fqdn")
+		manageData["Organization"] = viper.GetString("labca.organization")
+		if viper.Get("labca.web_title") == nil || viper.GetString("labca.web_title") == "" {
+			manageData["WebTitle"] = "LabCA"
+		} else {
+			manageData["WebTitle"] = viper.GetString("labca.web_title")
+		}
+		manageData["DNS"] = viper.GetString("labca.dns")
+		domainMode := viper.GetString("labca.domain_mode")
+		manageData["DomainMode"] = domainMode
+		if domainMode == "lockdown" {
+			manageData["LockdownDomains"] = viper.GetString("labca.lockdown")
+			manageData["LDPublicContacts"] = viper.GetBool("labca.ld_public_contacts")
+		}
+		if domainMode == "whitelist" {
+			manageData["WhitelistDomains"] = viper.GetString("labca.whitelist")
+		}
+		manageData["ExtendedTimeout"] = viper.GetBool("labca.extended_timeout")
+
+		manageData["DoEmail"] = viper.GetBool("labca.email.enable")
+		manageData["Server"] = viper.GetString("labca.email.server")
+		manageData["Port"] = viper.GetInt("labca.email.port")
+		manageData["EmailUser"] = viper.GetString("labca.email.user")
+		manageData["EmailPwd"] = ""
+		if viper.Get("labca.email.pass") != nil {
+			pwd := viper.GetString("labca.email.pass")
+			result, err := _decrypt(pwd)
+			if err == nil {
+				manageData["EmailPwd"] = string(result)
+			} else {
+				log.Printf("WARNING: could not decrypt email password: %s!\n", err.Error())
+			}
+		}
+		manageData["From"] = viper.GetString("labca.email.from")
+		manageData["TrustRoot"] = viper.GetString("labca.email.trust_root")
 	}
-	manageData["From"] = viper.GetString("labca.email.from")
 
 	manageData["Name"] = viper.GetString("user.name")
 	manageData["Email"] = viper.GetString("user.email")
+
+	manageData["Title"] = "Manage"
 
 	render(w, r, "manage", manageData)
 }
@@ -1123,6 +1643,54 @@ func manageHandler(w http.ResponseWriter, r *http.Request) {
 		_manageGet(w, r)
 	}
 }
+
+/*
+func manageNewRootHandler(w http.ResponseWriter, r *http.Request) {
+	if !viper.GetBool("config.complete") {
+		http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/setup", http.StatusFound)
+		return
+	}
+
+	// TODO: dynamically determine next filename (root-ca-2, root-ca-3, etc.)
+
+	if !_certCreate(w, r, "root-ca-3", true) {
+		// Cleanup the cert (if it even exists) so we will retry on the next run
+		if _, err := os.Stat("data/root-ca-3.pem"); !errors.Is(err, fs.ErrNotExist) {
+			exeCmd("mv data/root-ca-3.pem data/root-ca-3.pem_TMP")
+		}
+		return
+	}
+
+	// TODO: actually add the newly created key to the relevant config files (ca-a, ca-b, wfe2, possibly others)
+
+	// TODO: reload boulder!
+
+	http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/manage#certs", http.StatusSeeOther)
+}
+
+func manageNewIssuerHandler(w http.ResponseWriter, r *http.Request) {
+	if !viper.GetBool("config.complete") {
+		http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/setup", http.StatusFound)
+		return
+	}
+
+	// TODO: dynamically determine next filename (ca-int-2, ca-int-3, etc.)
+
+	// Is revertroot at all relevant in this scenario?
+
+	if !_certCreate(w, r, "ca-int-3", false) {
+		// Cleanup the cert (if it even exists) so we will retry on the next run
+		os.Remove("data/issuer/ca-int-3.pem")
+		return
+	}
+
+	// TODO: actually add the newly created key to the relevant config files (ca-a, ca-b, wfe2, possibly others)
+
+	// TODO: reload boulder!
+
+	http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/manage#certs", http.StatusSeeOther)
+}
+*/
 
 func logsHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -1151,19 +1719,17 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 	case "audit":
 		name = "ACME Audit Log"
 		message = "Live view on only the audit messages in the backend ACME application (Boulder) logs."
+	case "cron":
+		name = "Cron Log"
+		message = "Live view on the logs for the cron jobs for LabCA."
 	case "labca":
 		name = "LabCA Log"
 		message = "Live view on the logs for this LabCA web application."
 	case "web":
 		name = "Web Access Log"
 		message = "Live view on the NGINX web server access log."
-	case "weberr":
-		name = "Web Error Log"
-		message = "Log file for the NGINX web server error log."
-		wsurl = ""
-		data = getLog(w, r, logType)
 	default:
-		errorHandler(w, r, fmt.Errorf("Unknown log type '%s'", logType), http.StatusBadRequest)
+		errorHandler(w, r, fmt.Errorf("unknown log type '%s'", logType), http.StatusBadRequest)
 		return
 	}
 
@@ -1172,27 +1738,23 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 		"Message": message,
 		"Data":    data,
 		"WsUrl":   wsurl,
+		"Title":   "Logs",
 	})
 }
 
 func getLog(w http.ResponseWriter, r *http.Request, logType string) string {
-	ip, err := _discoverGateway()
+	conn, err := net.Dial("tcp", "control:3030")
 	if err != nil {
-		errorHandler(w, r, err, http.StatusInternalServerError)
-		return ""
-	}
-
-	conn, err := net.Dial("tcp", ip.String()+":3030")
-	if err != nil {
+		_, _ = exeCmd("sleep 5")
 		errorHandler(w, r, err, http.StatusInternalServerError)
 		return ""
 	}
 
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "log-"+logType+"\n")
+	fmt.Fprintf(conn, "log-%s\n", logType)
 	reader := bufio.NewReader(conn)
-	contents, err := ioutil.ReadAll(reader)
+	contents, err := io.ReadAll(reader)
 	if err != nil {
 		errorHandler(w, r, err, http.StatusInternalServerError)
 		return ""
@@ -1214,25 +1776,20 @@ func wsErrorHandler(err error) {
 }
 
 func showLog(ws *websocket.Conn, logType string) {
-	ip, err := _discoverGateway()
+	conn, err := net.Dial("tcp", "control:3030")
 	if err != nil {
-		wsErrorHandler(err)
-		return
-	}
-
-	conn, err := net.Dial("tcp", ip.String()+":3030")
-	if err != nil {
+		_, _ = exeCmd("sleep 5")
 		wsErrorHandler(err)
 		return
 	}
 
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "log-"+logType+"\n")
+	fmt.Fprintf(conn, "log-%s\n", logType)
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		msg := scanner.Text()
-		if logType != "audit" || strings.Index(msg, "[AUDIT]") > -1 {
+		if logType != "audit" || strings.Contains(msg, "[AUDIT]") {
 			ws.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := ws.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
 				// Probably "websocket: close sent"
@@ -1244,8 +1801,6 @@ func showLog(ws *websocket.Conn, logType string) {
 		wsErrorHandler(err)
 		return
 	}
-
-	return
 }
 
 func reader(ws *websocket.Conn) {
@@ -1270,14 +1825,11 @@ func writer(ws *websocket.Conn, logType string) {
 
 	go showLog(ws, logType)
 
-	for {
-		select {
-		case <-pingTicker.C:
-			ws.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := ws.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-				// Probably "websocket: close sent"
-				return
-			}
+	for range pingTicker.C {
+		ws.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := ws.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+			// Probably "websocket: close sent"
+			return
 		}
 	}
 }
@@ -1297,9 +1849,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	case "boulder":
 	case "audit":
 	case "labca":
+	case "cron":
 	case "web":
 	default:
-		errorHandler(w, r, fmt.Errorf("Unknown log type '%s'", logType), http.StatusBadRequest)
+		errorHandler(w, r, fmt.Errorf("unknown log type '%s'", logType), http.StatusBadRequest)
 		return
 	}
 
@@ -1313,13 +1866,18 @@ func _buildCI(r *http.Request, session *sessions.Session, isRoot bool) *Certific
 		CreateType:  "generate",
 		CommonName:  "Root CA",
 		RequestBase: r.Header.Get("X-Request-Base"),
+		NumDays:     3652, // 10 years
 	}
 	if !isRoot {
 		ci.CommonName = "CA"
+		ci.NumDays = 1826 // 5 years
 	}
 	ci.Initialize()
 
 	if session.Values["ct"] != nil {
+		if !isRoot && session.Values["ct"].(string) == "generate" {
+			ci.IsRootGenerated = true
+		}
 		ci.CreateType = session.Values["ct"].(string)
 	}
 	if session.Values["kt"] != nil {
@@ -1331,9 +1889,6 @@ func _buildCI(r *http.Request, session *sessions.Session, isRoot bool) *Certific
 	if session.Values["o"] != nil {
 		ci.Organization = session.Values["o"].(string)
 	}
-	if session.Values["ou"] != nil {
-		ci.OrgUnit = session.Values["ou"].(string)
-	}
 	if session.Values["cn"] != nil {
 		ci.CommonName = session.Values["cn"].(string)
 		ci.CommonName = strings.Replace(ci.CommonName, "Root", "", -1)
@@ -1343,17 +1898,154 @@ func _buildCI(r *http.Request, session *sessions.Session, isRoot bool) *Certific
 	return ci
 }
 
-func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot bool) bool {
-	path := "data/"
-	if !isRoot {
-		path = path + "issuer/"
+func issuerNameID(certfile string) (int64, error) {
+	cf, err := os.ReadFile(certfile)
+	if err != nil {
+		log.Printf("issuerNameID: could not read cert file: %v", err)
+		return 0, err
 	}
 
-	if _, err := os.Stat(path + certBase + ".pem"); os.IsNotExist(err) {
-		session := getSession(w, r)
+	cpb, _ := pem.Decode(cf)
+	crt, err := x509.ParseCertificate(cpb.Bytes)
+	if err != nil {
+		log.Printf("issuerNameID: could not parse x509 file: %v", err)
+		return 0, err
+	}
+
+	// From issuance/issuance.go : func truncatedHash
+	h := crypto.SHA1.New()
+	h.Write(crt.RawSubject)
+	s := h.Sum(nil)
+	return int64(big.NewInt(0).SetBytes(s[:7]).Int64()), nil
+}
+
+func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot bool) bool {
+	if r.Method == "POST" {
+		if err := r.ParseMultipartForm(2 * 1024 * 1024); err != nil {
+			errorHandler(w, r, err, http.StatusInternalServerError)
+			return false
+		}
+
+		if r.Form.Get("revertroot") != "" {
+			// From issuer certificate creation page it is possible to remove the root again and start over
+			rootseqnr := "01"
+			seqnr := "01"
+			err := deleteFiles(fmt.Sprintf("%sroot-%s*", CERT_FILES_PATH, rootseqnr))
+			if err != nil {
+				fmt.Printf("failed to delete root %s files: %+v\n", rootseqnr, err.Error())
+			}
+			err = deleteFiles(fmt.Sprintf("%sissuer-%s*", CERT_FILES_PATH, seqnr))
+			if err != nil {
+				fmt.Printf("failed to delete issuer %s files: %+v\n", seqnr, err.Error())
+			}
+
+			cfg := &HSMConfig{}
+			cfg.Initialize("issuer", seqnr)
+			cfg.ClearAll()
+			cfg.Initialize("root", rootseqnr)
+			cfg.ClearAll()
+
+			certBase = "root-01"
+			isRoot = true
+			r.Method = "GET"
+			sess, _ := sessionStore.Get(r, "labca")
+			sess.Values["ct"] = "generate"
+			if err := sess.Save(r, w); err != nil {
+				log.Printf("cannot save session: %s\n", err)
+			}
+
+		} else if r.Form.Get("ack-rootkey") == "yes" {
+			// Root Key was shown, do we need to keep it online?
+			viper.Set("keep_root_offline", r.Form.Get("keep-root-online") != "true")
+			viper.WriteConfig()
+
+			// Undo what setupHandler did when showing the public key...
+			_, errPem := os.Stat("data/root-ca.pem")
+			_, errTmp := os.Stat("data/root-ca.pem_TMP")
+			if errors.Is(errPem, fs.ErrNotExist) && !errors.Is(errTmp, fs.ErrNotExist) {
+				exeCmd("mv data/root-ca.pem_TMP data/root-ca.pem")
+			}
+
+			r.Method = "GET"
+			return true
+		}
+	}
+
+	if _, err := os.Stat(CERT_FILES_PATH + certBase + "-cert.pem"); errors.Is(err, fs.ErrNotExist) {
+		session, _ := sessionStore.Get(r, "labca")
 
 		if r.Method == "GET" {
 			ci := _buildCI(r, session, isRoot)
+			if isRoot && (certBase == "root-ca" || certBase == "test-root" || certBase == "root-01") {
+				ci.IsFirst = true
+			} else if !isRoot && (certBase == "ca-int" || certBase == "test-ca" || certBase == "issuer-01") {
+				ci.IsFirst = true
+			}
+
+			if len(r.URL.Query()["root"]) > 0 {
+				certFile := locateFile(r.URL.Query()["root"][0] + ".pem")
+
+				ci.RootEnddate, err = getCertFileNotAFter(certFile)
+				if err != nil {
+					fmt.Println(err.Error())
+					errorHandler(w, r, err, http.StatusInternalServerError)
+					return false
+				}
+
+				ci.RootSubject, err = getCertFileSubject(certFile)
+				if err != nil {
+					fmt.Println(err.Error())
+					errorHandler(w, r, err, http.StatusInternalServerError)
+					return false
+				}
+				subjectMap := parseSubjectDn(ci.RootSubject)
+				if val, ok := subjectMap["C"]; ok {
+					ci.Country = val
+				}
+				if val, ok := subjectMap["O"]; ok {
+					ci.Organization = val
+				}
+			} else if !isRoot {
+				certFile := CERT_FILES_PATH + "root-01-cert.pem"
+
+				// The rules are quite strict on what type is allowed for issuer certs!
+				crt, err := readCertificate(certFile)
+				if err == nil {
+					validKeyTypes := make(map[string]string)
+
+					if crt.PublicKeyAlgorithm == x509.RSA {
+						for k, v := range ci.KeyTypes {
+							if strings.HasPrefix(k, "rsa") {
+								validKeyTypes[k] = v
+							}
+						}
+					}
+
+					if crt.PublicKeyAlgorithm == x509.ECDSA {
+						if crt.SignatureAlgorithm == x509.ECDSAWithSHA256 {
+							validKeyTypes["ecdsa256"] = "ECDSA-256"
+						}
+						if crt.SignatureAlgorithm == x509.ECDSAWithSHA384 {
+							validKeyTypes["ecdsa384"] = "ECDSA-384"
+						}
+					}
+
+					ci.KeyTypes = validKeyTypes
+				}
+
+				ci.RootEnddate, err = getCertFileNotAFter(certFile)
+				if err != nil {
+					fmt.Println(err.Error())
+					errorHandler(w, r, err, http.StatusInternalServerError)
+					return false
+				}
+				ci.RootSubject, err = getCertFileSubject(certFile)
+				if err != nil {
+					fmt.Println(err.Error())
+					errorHandler(w, r, err, http.StatusInternalServerError)
+					return false
+				}
+			}
 
 			render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
 			return false
@@ -1363,7 +2055,9 @@ func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot
 				return false
 			}
 
-			ci := &CertificateInfo{}
+			ci := &CertificateInfo{
+				IsRoot: r.Form.Get("cert") == "root",
+			}
 			ci.Initialize()
 			ci.IsRoot = r.Form.Get("cert") == "root"
 			ci.CreateType = r.Form.Get("createtype")
@@ -1373,8 +2067,20 @@ func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot
 			}
 			ci.Country = r.Form.Get("c")
 			ci.Organization = r.Form.Get("o")
-			ci.OrgUnit = r.Form.Get("ou")
 			ci.CommonName = r.Form.Get("cn")
+
+			ci.RootEnddate = r.Form.Get("root-enddate")
+			ci.RootSubject = r.Form.Get("root-subject")
+			if r.Form.Get("numdays") != "" {
+				ci.NumDays, err = strconv.Atoi(r.Form.Get("numdays"))
+				if err != nil {
+					if ci.IsRoot {
+						ci.NumDays = 3652
+					} else {
+						ci.NumDays = 1826
+					}
+				}
+			}
 
 			if ci.CreateType == "import" {
 				file, handler, err := r.FormFile("import")
@@ -1395,16 +2101,110 @@ func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot
 			ci.Certificate = r.Form.Get("certificate")
 			ci.RequestBase = r.Header.Get("X-Request-Base")
 
-			if ci.Validate() == false {
-				render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
-				return false
+			if !ci.Validate() {
+				if session.Values["csr"] == true {
+					delete(ci.Errors, "Key")
+				} else {
+					render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+					return false
+				}
 			}
 
-			if err := ci.Create(path, certBase); err != nil {
-				ci.Errors[strings.Title(ci.CreateType)] = err.Error()
-				log.Printf("_certCreate: create failed: %v", err)
-				render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
-				return false
+			wasCSR := session.Values["csr"] == true
+			if r.Form.Get("ack-rootkey") != "yes" {
+				if r.Form.Get("rootkey") != "" {
+					rootci := &CertificateInfo{
+						IsRoot:     true,
+						Key:        r.Form.Get("rootkey"),
+						Passphrase: r.Form.Get("rootpassphrase"),
+					}
+					if !rootci.StoreRootKey("data/") {
+						ci.Errors["Modal"] = rootci.Errors["Modal"]
+						render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "GetRootKey": true, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+						return false
+					}
+				}
+				if r.Form.Get("crl") != "" {
+					rootci := &CertificateInfo{
+						IsRoot: true,
+						CRL:    r.Form.Get("crl"),
+					}
+					if !rootci.StoreCRL("data/") {
+						ci.Errors["Modal"] = rootci.Errors["Modal"]
+						csr, err := os.Open(CERT_FILES_PATH + certBase + ".csr") // TODO !!
+						if err != nil {
+							ci.Errors[cases.Title(language.Und).String(ci.CreateType)] = "Error reading .csr file! See LabCA logs for details"
+							log.Printf("_certCreate: read csr: %v", err)
+							render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+							return false
+						}
+						defer csr.Close()
+						b, _ := io.ReadAll(csr)
+
+						render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "CSR": string(b), "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+						return false
+					}
+				}
+
+				if err := ci.Create(certBase, wasCSR); err != nil {
+					if err.Error() == "NO_ROOT_KEY" {
+						if r.Form.Get("generate") != "" {
+							if r.Form.Get("rootkey") == "" {
+								render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "GetRootKey": true, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+								return false
+							} else {
+								rootci := &CertificateInfo{
+									IsRoot:     true,
+									Key:        r.Form.Get("rootkey"),
+									Passphrase: r.Form.Get("rootpassphrase"),
+								}
+								if !rootci.StoreRootKey("data/") {
+									ci.Errors["Modal"] = rootci.Errors["Modal"]
+									render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "GetRootKey": true, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+									return false
+								}
+
+								render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+								return false
+							}
+						}
+
+						if r.Form.Get("getcsr") != "" {
+							csr, err := os.Open(CERT_FILES_PATH + certBase + ".csr") // TODO !
+							if err != nil {
+								ci.Errors[cases.Title(language.Und).String(ci.CreateType)] = "Error reading .csr file! See LabCA logs for details"
+								log.Printf("_certCreate: read csr: %v", err)
+								render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+								return false
+							}
+							defer csr.Close()
+							b, _ := io.ReadAll(csr)
+
+							session.Values["csr"] = true
+							if err = session.Save(r, w); err != nil {
+								log.Printf("cannot save session: %s\n", err)
+							}
+
+							render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "CSR": string(b), "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+							return false
+						}
+					} else {
+						ci.Errors[cases.Title(language.Und).String(ci.CreateType)] = err.Error()
+						log.Printf("_certCreate: create failed: %v", err)
+						render(w, r, "cert:manage", map[string]interface{}{"CertificateInfo": ci, "Progress": _progress(certBase), "HelpText": _helptext(certBase)})
+						return false
+					}
+				}
+			}
+
+			if !ci.IsRoot {
+				nameID, err := issuerNameID(CERT_FILES_PATH + "issuer-01-cert.pem")
+				if err == nil {
+					viper.Set("issuer_name_id", nameID)
+					viper.WriteConfig()
+				} else {
+					log.Printf("_certCreate: could not calculate IssuerNameID: %v", err)
+				}
 			}
 
 			if viper.Get("labca.organization") == nil {
@@ -1416,9 +2216,10 @@ func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot
 			session.Values["kt"] = ci.KeyType
 			session.Values["c"] = ci.Country
 			session.Values["o"] = ci.Organization
-			session.Values["ou"] = ci.OrgUnit
 			session.Values["cn"] = ci.CommonName
-			session.Save(r, w)
+			if err = session.Save(r, w); err != nil {
+				log.Printf("cannot save session: %s\n", err)
+			}
 
 			// Fake the method to GET as we need to continue in the setupHandler() function
 			r.Method = "GET"
@@ -1431,63 +2232,45 @@ func _certCreate(w http.ResponseWriter, r *http.Request, certBase string, isRoot
 	return true
 }
 
-func _parseLinuxIPRouteShow(output []byte) (net.IP, error) {
-	// Linux '/usr/bin/ip route show' format looks like this:
-	// default via 192.168.178.1 dev wlp3s0  metric 303
-	// 192.168.178.0/24 dev wlp3s0  proto kernel  scope link  src 192.168.178.76  metric 303
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == "default" {
-			ip := net.ParseIP(fields[2])
-			if ip != nil {
-				return ip, nil
-			}
-		}
-	}
-
-	return nil, errors.New("no gateway found")
-}
-
-func _discoverGateway() (net.IP, error) {
-	if isDev {
-		ip := net.ParseIP("127.0.0.1")
-		if ip != nil {
-			return ip, nil
-		}
-	}
-
-	routeCmd := exec.Command("ip", "route", "show")
-	output, err := routeCmd.CombinedOutput()
+func deleteFiles(pattern string) error {
+	files, err := filepath.Glob(pattern)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to find files: %w", err)
 	}
 
-	return _parseLinuxIPRouteShow(output)
+	ok := true
+	for _, file := range files {
+		err := os.Remove(file)
+		if err != nil {
+			ok = false
+			fmt.Printf("failed to remove %s: %v\n", file, err)
+		}
+	}
+
+	if !ok {
+		return fmt.Errorf("failed to remove at least one file, see logs for details")
+	}
+
+	return nil
 }
 
 func _hostCommand(w http.ResponseWriter, r *http.Request, command string, params ...string) bool {
-	ip, err := _discoverGateway()
+	conn, err := net.Dial("tcp", "control:3030")
 	if err != nil {
-		errorHandler(w, r, err, http.StatusInternalServerError)
-		return false
-	}
-
-	conn, err := net.Dial("tcp", ip.String()+":3030")
-	if err != nil {
+		_, _ = exeCmd("sleep 5")
 		errorHandler(w, r, err, http.StatusInternalServerError)
 		return false
 	}
 
 	defer conn.Close()
 
-	fmt.Fprintf(conn, command+"\n")
+	fmt.Fprint(conn, command+"\n")
 	for _, param := range params {
-		fmt.Fprintf(conn, param+"\n")
+		fmt.Fprint(conn, param+"\n")
 	}
 
 	reader := bufio.NewReader(conn)
-	message, err := ioutil.ReadAll(reader)
+	message, err := io.ReadAll(reader)
 	if err != nil {
 		errorHandler(w, r, err, http.StatusInternalServerError)
 		return false
@@ -1497,14 +2280,28 @@ func _hostCommand(w http.ResponseWriter, r *http.Request, command string, params
 		return true
 	}
 
-	tail := message[len(message)-4:]
-	if strings.Compare(string(tail), "\nok\n") == 0 {
-		msg := message[0 : len(message)-4]
-		log.Printf("Message from server: '%s'", msg)
-		return true
+	if len(message) >= 4 {
+		tail := message[len(message)-4:]
+		if strings.Compare(string(tail), "\nok\n") == 0 {
+			msg := message[0 : len(message)-4]
+			log.Printf("Message from server: '%s'", msg)
+			return true
+		}
 	}
 
 	log.Printf("ERROR: Message from server: '%s'", message)
+	if command == "test-email" {
+		// Want special error handling for this case
+		res := makeErrorsResponse(false)
+		if strings.Contains(string(message), "certificate signed by unknown authority") {
+			res.Errors["EmailSend"] = "Error: SMTP server certificate signed by unknown authority"
+		} else {
+			res.Errors["EmailSend"] = "Failed to send email - see logs"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
+		return false
+	}
 	errorHandler(w, r, errors.New(string(message)), http.StatusInternalServerError)
 	return false
 }
@@ -1516,44 +2313,6 @@ func randToken() string {
 }
 
 func _applyConfig() error {
-	os.Setenv("PKI_ROOT_CERT_BASE", "data/root-ca")
-	os.Setenv("PKI_INT_CERT_BASE", "data/issuer/ca-int")
-	os.Setenv("PKI_DEFAULT_O", viper.GetString("labca.organization"))
-	os.Setenv("PKI_DNS", viper.GetString("labca.dns"))
-	domain := viper.GetString("labca.fqdn")
-	os.Setenv("PKI_FQDN", domain)
-	pos := strings.Index(domain, ".")
-	if pos > -1 {
-		pos = pos + 1
-		domain = domain[pos:]
-	}
-	os.Setenv("PKI_DOMAIN", domain)
-	os.Setenv("PKI_DOMAIN_MODE", viper.GetString("labca.domain_mode"))
-	os.Setenv("PKI_LOCKDOWN_DOMAINS", viper.GetString("labca.lockdown"))
-	os.Setenv("PKI_WHITELIST_DOMAINS", viper.GetString("labca.whitelist"))
-	if viper.GetBool("labca.extended_timeout") {
-		os.Setenv("PKI_EXTENDED_TIMEOUT", "1")
-	} else {
-		os.Setenv("PKI_EXTENDED_TIMEOUT", "0")
-	}
-	if viper.GetBool("labca.email.enable") {
-		os.Setenv("PKI_EMAIL_SERVER", viper.GetString("labca.email.server"))
-		os.Setenv("PKI_EMAIL_PORT", viper.GetString("labca.email.port"))
-		os.Setenv("PKI_EMAIL_USER", viper.GetString("labca.email.user"))
-		res, err := _decrypt(viper.GetString("labca.email.pass"))
-		if err != nil {
-			log.Println("WARNING: could not decrypt stored password: " + err.Error())
-		}
-		os.Setenv("PKI_EMAIL_PASS", string(res))
-		os.Setenv("PKI_EMAIL_FROM", viper.GetString("labca.email.from"))
-	} else {
-		os.Setenv("PKI_EMAIL_SERVER", "localhost")
-		os.Setenv("PKI_EMAIL_PORT", "9380")
-		os.Setenv("PKI_EMAIL_USER", "cert-master@example.com")
-		os.Setenv("PKI_EMAIL_PASS", "password")
-		os.Setenv("PKI_EMAIL_FROM", "Expiry bot <test@example.com>")
-	}
-
 	_, err := exeCmd("./apply")
 	if err != nil {
 		fmt.Println("")
@@ -1575,12 +2334,12 @@ func _progress(stage string) int {
 	}
 	curr += 3.0
 
-	if stage == "root-ca" {
+	if stage == "root-01" {
 		return int(math.Round(curr / max))
 	}
 	curr += 4.0
 
-	if stage == "ca-int" {
+	if stage == "issuer-01" {
 		return int(math.Round(curr / max))
 	}
 	curr += 3.0
@@ -1599,14 +2358,24 @@ func _progress(stage string) int {
 		return int(math.Round(curr / max))
 	}
 
+	if stage == "standalone" {
+		return int(math.Round(0.6 * curr / max))
+	}
+
 	return 0
 }
 
 func _helptext(stage string) template.HTML {
 	if stage == "register" {
-		return template.HTML(fmt.Sprint("<p>You need to create an admin account for managing this instance of\n",
-			"LabCA. There can only be one admin account, but you can configure all its attributes once the\n",
-			"initial setup has completed.</p>"))
+		return template.HTML(fmt.Sprint("<p class=\"form-register\">You need to create an admin account for\n",
+			"managing this instance of LabCA. There can only be one admin account, but you can configure all\n",
+			"its attributes once the initial setup has completed.<br><br><b>Instead, you can also\n",
+			"<a href=\"#\" onclick=\"false\" class=\"toggle-restore\">restore from a backup file</a> of a\n",
+			"previous LabCA installation.</b></p>\n",
+			"<p class=\"form-restore\">If you have a backup file from a previous LabCA installation and want to\n",
+			"restore this instance with the exact same configuration, use that backup file here.\n",
+			"<br><br>Otherwise you should follow the <a href=\"#\" onclick=\"false\"\n",
+			"class=\"toggle-register\">standard setup</a>.</p>"))
 	} else if stage == "setup" {
 		return template.HTML(fmt.Sprint("<p>The fully qualified domain name (FQDN) is what end users will use\n",
 			"to connect to this server. It was provided in the initial setup and is shown here for reference.</p>\n",
@@ -1616,22 +2385,30 @@ func _helptext(stage string) template.HTML {
 			"domain, e.g. '.localdomain'. In lockdown mode only those domains are allowed. In whitelist mode\n",
 			"those domains are allowed next to all official, internet accessible domains and in standard\n",
 			"mode only the official domains are allowed.</p>"))
-	} else if stage == "root-ca" {
+	} else if stage == "root-01" {
 		return template.HTML(fmt.Sprint("<p>This is the top level certificate that will sign the issuer\n",
 			"certificate(s). You can either generate a fresh Root CA (Certificate Authority) or import an\n",
 			"existing one, e.g. a backup from another LabCA instance.</p>\n",
-			"<p>If you want to generate a certificate, pick a key type and strength (the higher the number the\n",
-			"more secure, ECDSA is more modern than RSA), provide at least a country and organization name,\n",
+			"<p>If you want to <b>generate</b> a new certificate, pick a key type and strength (the higher the number the\n",
+			"more secure, ECDSA is more modern than RSA), provide a country and organization name,\n",
 			"and the common name. It is recommended that the common name contains the word 'Root' as well\n",
 			"as your organization name so you can recognize it, and that's why that is automatically filled\n",
-			"once you leave the organization field.</p>"))
-	} else if stage == "ca-int" {
+			"once you leave the organization field.</p>\n",
+			"<p>If you want to <b>upload</b> an existing root certificate, you may choose to keep the private key\n",
+			"offline for security reasons according to best practices. If you do include it here, we will be able\n",
+			"to generate an issuing certificate automatically in the next step. If you don't include it, we will\n",
+			"ask for it when needed.</p>"))
+	} else if stage == "issuer-01" {
 		return template.HTML(fmt.Sprint("<p>This is what end users will see as the issuing certificate. Again,\n",
 			"you can either generate a fresh certificate or import an existing one, as long as it is signed by\n",
 			"the Root CA from the previous step.</p>\n",
-			"<p>If you want to generate a certificate, by default the same key type and strength is selected as\n",
-			"was chosen in the previous step when generating the root, but you may choose a different one. By\n",
-			"default the common name is the same as the CN for the Root CA, minus the word 'Root'.</p>"))
+			"<p>If you want to <b>generate</b> a certificate, by default the same key type and strength is selected as\n",
+			"was chosen in the previous step when generating the root, but you may choose a different\n",
+			"one (if technically possible). By default the common name is the same as the CN for the Root CA, minus\n",
+			"the word 'Root'.</p>\n"))
+	} else if stage == "standalone" {
+		return template.HTML(fmt.Sprint("<p>Currently only step-ca is supported, using the MySQL database backend.\n",
+			"Please provide the necessary connectiuon details here."))
 	} else {
 		return template.HTML("")
 	}
@@ -1645,11 +2422,115 @@ func _setupAdminUser(w http.ResponseWriter, r *http.Request) bool {
 		render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
 		return false
 	} else if r.Method == "POST" {
-		if err := r.ParseForm(); err != nil {
-			errorHandler(w, r, err, http.StatusInternalServerError)
+		isMultipart := true
+		if err := r.ParseMultipartForm(1 * 1024 * 1024); err != nil {
+			isMultipart = false
+			if err != http.ErrNotMultipart {
+				errorHandler(w, r, err, http.StatusInternalServerError)
+				return false
+			} else if err := r.ParseForm(); err != nil {
+				errorHandler(w, r, err, http.StatusInternalServerError)
+				return false
+			}
+		}
+
+		// Restore a backup file
+		if isMultipart {
+			reg := &User{
+				Errors:      make(map[string]string),
+				RequestBase: r.Header.Get("X-Request-Base"),
+			}
+			file, header, err := r.FormFile("file")
+			if err != nil {
+				fmt.Println(err)
+				reg.Errors["File"] = "Could not read uploaded file"
+				render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+				return false
+			}
+			defer file.Close()
+
+			out, err := os.Create("/opt/backup/" + header.Filename)
+			if err != nil {
+				fmt.Println(err)
+				reg.Errors["File"] = "Could not create local file"
+				render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+				return false
+			}
+			defer out.Close()
+
+			_, copyError := io.Copy(out, file)
+			if copyError != nil {
+				fmt.Println(err)
+				reg.Errors["File"] = "Could not store uploaded file"
+				render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+				return false
+			}
+
+			// Cannot use _hostCommand() as we need different error handling
+			conn, err := net.Dial("tcp", "control:3030")
+			if err != nil {
+				fmt.Println(err)
+				reg.Errors["File"] = "Could not import backup file: error communicating with control"
+				render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+				return false
+			}
+			defer conn.Close()
+
+			fmt.Fprint(conn, "backup-restore\n"+header.Filename+"\n")
+			reader := bufio.NewReader(conn)
+			message, err := io.ReadAll(reader)
+			if err != nil {
+				fmt.Println(err)
+				reg.Errors["File"] = "Could not import backup file: error reading control response"
+				render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+				return false
+			}
+
+			if strings.Compare(string(message), "ok\n") == 0 {
+				if err := viper.ReadInConfig(); err != nil {
+					fmt.Println(err)
+					reg.Errors["File"] = "Could not read config after importing backup"
+					render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+					return false
+				}
+
+				viper.Set("config.complete", false)
+				viper.WriteConfig()
+
+				err = _applyConfig()
+				if err != nil {
+					fmt.Println("Could not apply config, trying to migrate by restarting...")
+					_hostCommand(w, r, "labca-restart")
+					reg.Errors["File"] = "Could not apply config, trying to migrate by restarting..."
+					render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+					return false
+				}
+
+				defer _hostCommand(w, r, "docker-restart")
+				http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/final", http.StatusFound)
+				return true
+			}
+
+			if len(message) >= 4 {
+				tail := message[len(message)-4:]
+				if strings.Compare(string(tail), "\nok\n") == 0 {
+					msg := message[0 : len(message)-4]
+					log.Printf("Message from server: '%s'", msg)
+					lines := strings.Split(strings.TrimSpace(string(msg)), "\n")
+					reg.Errors["File"] = "Could not import backup file: " + lines[0]
+					render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
+					return false
+				}
+			}
+
+			log.Printf("ERROR: Message from server: '%s'", message)
+			lines := strings.Split(strings.TrimSpace(string(message)), "\n")
+			reg.Errors["File"] = "Could not import backup file: " + lines[0]
+			render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
 			return false
 		}
 
+		// Regular setup form handling
 		reg := &User{
 			Name:        r.Form.Get("username"),
 			Email:       r.Form.Get("email"),
@@ -1658,7 +2539,7 @@ func _setupAdminUser(w http.ResponseWriter, r *http.Request) bool {
 			RequestBase: r.Header.Get("X-Request-Base"),
 		}
 
-		if reg.Validate(true, false) == false {
+		if !reg.Validate(true, false) {
 			render(w, r, "register:manage", map[string]interface{}{"User": reg, "IsLogin": true, "Progress": _progress("register"), "HelpText": _helptext("register")})
 			return false
 		}
@@ -1673,9 +2554,11 @@ func _setupAdminUser(w http.ResponseWriter, r *http.Request) bool {
 		viper.Set("user.password", string(hash))
 		viper.WriteConfig()
 
-		session := getSession(w, r)
+		session, _ := sessionStore.Get(r, "labca")
 		session.Values["user"] = reg.Name
-		session.Save(r, w)
+		if err = session.Save(r, w); err != nil {
+			log.Printf("cannot save session: %s\n", err)
+		}
 
 		// Fake the method to GET as we need to continue in the setupHandler() function
 		r.Method = "GET"
@@ -1701,6 +2584,7 @@ func _setupBaseConfig(w http.ResponseWriter, r *http.Request) bool {
 			DomainMode:       "lockdown",
 			LockdownDomains:  domain,
 			WhitelistDomains: domain,
+			LDPublicContacts: true,
 			RequestBase:      r.Header.Get("X-Request-Base"),
 		}
 
@@ -1718,10 +2602,11 @@ func _setupBaseConfig(w http.ResponseWriter, r *http.Request) bool {
 			DomainMode:       r.Form.Get("domain_mode"),
 			LockdownDomains:  r.Form.Get("lockdown_domains"),
 			WhitelistDomains: r.Form.Get("whitelist_domains"),
+			LDPublicContacts: (r.Form.Get("ld_public_contacts") == "true"),
 			RequestBase:      r.Header.Get("X-Request-Base"),
 		}
 
-		if cfg.Validate(false) == false {
+		if !cfg.Validate(false) {
 			render(w, r, "setup:manage", map[string]interface{}{"SetupConfig": cfg, "Progress": _progress("setup"), "HelpText": _helptext("setup")})
 			return false
 		}
@@ -1736,6 +2621,7 @@ func _setupBaseConfig(w http.ResponseWriter, r *http.Request) bool {
 		viper.Set("labca.domain_mode", cfg.DomainMode)
 		if cfg.DomainMode == "lockdown" {
 			viper.Set("labca.lockdown", cfg.LockdownDomains)
+			viper.Set("labca.ld_public_contacts", cfg.LDPublicContacts)
 		}
 		if cfg.DomainMode == "whitelist" {
 			viper.Set("labca.whitelist", cfg.WhitelistDomains)
@@ -1752,8 +2638,96 @@ func _setupBaseConfig(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func writeStandaloneConfig(cfg *StandaloneConfig) {
+	conn := cfg.MySQLUser
+	if cfg.MySQLPasswd != "" {
+		conn += ":" + cfg.MySQLPasswd
+	}
+	conn += "@"
+	_, err := strconv.Atoi(string(strings.TrimSpace(cfg.MySQLServer)[0]))
+	if err == nil {
+		conn += "tcp(" + cfg.MySQLServer + ":" + cfg.MySQLPort + ")"
+	} else {
+		conn += cfg.MySQLServer + ":" + cfg.MySQLPort
+	}
+	conn += "/" + cfg.MySQLDBName
+
+	restart := viper.GetBool("server.https") != cfg.UseHTTPS || viper.GetString("server.cert") != cfg.CertPath || viper.GetString("server.key") != cfg.KeyPath
+	dbConn = conn
+	viper.Set("db.conn", conn)
+	viper.Set("backend", cfg.Backend)
+	viper.Set("server.https", cfg.UseHTTPS)
+	if cfg.UseHTTPS {
+		viper.Set("server.cert", cfg.CertPath)
+		viper.Set("server.key", cfg.KeyPath)
+	}
+	viper.Set("config.complete", true)
+	viper.WriteConfig()
+
+	if restart {
+		if cfg.UseHTTPS {
+			fmt.Println("### Please restart the application to use the HTTPS certificate!")
+		} else {
+			fmt.Println("### Please restart the application!")
+		}
+	}
+}
+
+func setupStandalone(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		cfg := &StandaloneConfig{
+			RequestBase: r.Header.Get("X-Request-Base"),
+			Backend:     "step-ca",
+			MySQLServer: "127.0.0.1",
+			MySQLPort:   "3306",
+			MySQLDBName: "stepca",
+			UseHTTPS:    false,
+			CertPath:    configPath + string(os.PathSeparator) + "labca.crt",
+			KeyPath:     configPath + string(os.PathSeparator) + "labca.key",
+		}
+
+		render(w, r, "standalone:manage", map[string]interface{}{"SetupConfig": cfg, "Progress": _progress("standalone"), "HelpText": _helptext("standalone")})
+		return
+
+	} else if r.Method == "POST" {
+		if err := r.ParseForm(); err != nil {
+			errorHandler(w, r, err, http.StatusInternalServerError)
+			return
+		}
+
+		cfg := &StandaloneConfig{
+			Backend:     r.Form.Get("backend"),
+			MySQLServer: r.Form.Get("mysql_server"),
+			MySQLPort:   r.Form.Get("mysql_port"),
+			MySQLDBName: r.Form.Get("mysql_dbname"),
+			MySQLUser:   r.Form.Get("mysql_user"),
+			MySQLPasswd: r.Form.Get("mysql_passwd"),
+			UseHTTPS:    (r.Form.Get("use_https") == "https"),
+			CertPath:    r.Form.Get("cert_path"),
+			KeyPath:     r.Form.Get("key_path"),
+			RequestBase: r.Header.Get("X-Request-Base"),
+		}
+
+		if !cfg.Validate() {
+			render(w, r, "standalone:manage", map[string]interface{}{"SetupConfig": cfg, "Progress": _progress("standalone"), "HelpText": _helptext("standalone")})
+			return
+		}
+
+		writeStandaloneConfig(cfg)
+
+		// Fake the method to GET as we need to continue in the setupHandler() function
+		r.Method = "GET"
+
+	} else {
+		http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/setup", http.StatusSeeOther)
+		return
+	}
+
+	http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/", http.StatusFound)
+}
+
 func setupHandler(w http.ResponseWriter, r *http.Request) {
-	if viper.GetBool("config.complete") == true {
+	if viper.GetBool("config.complete") {
 		render(w, r, "index:manage", map[string]interface{}{"Message": template.HTML("Setup already completed! Go <a href=\"" + r.Header.Get("X-Request-Base") + "/\">home</a>")})
 		return
 	}
@@ -1765,6 +2739,12 @@ func setupHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 1a. Go to standalone setup
+	if viper.GetBool("standalone") {
+		setupStandalone(w, r)
+		return
+	}
+
 	// 2. Setup essential configuration
 	if viper.Get("labca.dns") == nil {
 		if !_setupBaseConfig(w, r) {
@@ -1773,12 +2753,18 @@ func setupHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Setup root CA certificate
-	if !_certCreate(w, r, "root-ca", true) {
+	if !_certCreate(w, r, "root-01", true) {
+		// Cleanup the cert (if it even exists) so we will retry on the next run
+		if _, err := os.Stat(CERT_FILES_PATH + "root-01-cert.pem"); !errors.Is(err, fs.ErrNotExist) {
+			exeCmd("mv " + CERT_FILES_PATH + "root-01-cert.pem " + CERT_FILES_PATH + "root-01-cert.pem_TMP")
+		}
 		return
 	}
 
 	// 4. Setup issuer certificate
-	if !_certCreate(w, r, "ca-int", false) {
+	if !_certCreate(w, r, "issuer-01", false) {
+		// Cleanup the cert (if it even exists) so we will retry on the next run
+		os.Remove(CERT_FILES_PATH + "issuer-01-cert.pem")
 		return
 	}
 
@@ -1790,13 +2776,9 @@ func setupHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !viper.GetBool("config.restarted") {
-		// 6. Trust the new certs
-		if !_hostCommand(w, r, "trust-store") {
-			return
-		}
-
 		// Don't let the retry mechanism generate new restartSecret!
 		if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
+			_, _ = exeCmd("sleep 5")
 			render(w, r, "index", map[string]interface{}{"Message": "Retry OK"})
 		} else {
 			// 8. Restart application
@@ -1846,31 +2828,58 @@ func finalHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Don't let the retry mechanism trigger a certificate request and restart!
-	if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
-		render(w, r, "index", map[string]interface{}{"Message": "Retry OK"})
-	} else {
-		// 9. Setup our own web certificate
-		if !_hostCommand(w, r, "acme-request") {
-			http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/logs/cert", http.StatusSeeOther)
-			return
+	t := viper.GetTime("config.cert_requested")
+	if !t.IsZero() && t.After(time.Now().Add(-5*time.Minute)) {
+		// Too soon
+		if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
+			w.Header().Set("Content-Type", "application/json")
+			if viper.GetBool("config.error") {
+				viper.Set("config.cert_requested", nil)
+				viper.WriteConfig()
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"complete": viper.GetBool("config.complete"), "error": viper.GetBool("config.error")})
+		} else {
+			render(w, r, "polling:manage", map[string]interface{}{"Progress": _progress("polling"), "HelpText": _helptext("polling")})
 		}
+		return
+	}
 
-		// 10. remove the temporary bit from nginx config
-		if !_hostCommand(w, r, "nginx-remove-redirect") {
-			return
-		}
-
-		// 11. reload nginx
-		if !_hostCommand(w, r, "nginx-reload") {
-			return
-		}
-
-		viper.Set("config.complete", true)
+	viper.Set("config.cert_requested", time.Now())
+	if viper.GetBool("config.error") {
+		viper.Set("config.error", false)
+	}
+	viper.WriteConfig()
+	// 9. Setup our own web certificate
+	if !_hostCommand(w, r, "acme-request") {
+		viper.Set("config.error", true)
 		viper.WriteConfig()
+		http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/logs/cert", http.StatusSeeOther)
+		return
+	}
 
+	// 10. remove the temporary bit from nginx config
+	if !_hostCommand(w, r, "nginx-remove-redirect") {
+		return
+	}
+
+	// 11. reload nginx
+	if !_hostCommand(w, r, "nginx-reload") {
+		return
+	}
+
+	viper.Set("config.complete", true)
+	viper.WriteConfig()
+
+	if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"complete": viper.GetBool("config.complete")})
+	} else {
 		render(w, r, "final:manage", map[string]interface{}{"RequestBase": r.Header.Get("X-Request-Base"), "Progress": _progress("final"), "HelpText": _helptext("final")})
 	}
+}
+
+func showErrorHandler(w http.ResponseWriter, r *http.Request) {
+	errorHandler(w, r, nil, http.StatusInternalServerError)
 }
 
 // RangeStructer takes the first argument, which must be a struct, and
@@ -1913,7 +2922,7 @@ func accountsHandler(w http.ResponseWriter, r *http.Request) {
 
 	Accounts, err := GetAccounts(w, r)
 	if err == nil {
-		render(w, r, "list:accounts", map[string]interface{}{"List": Accounts})
+		render(w, r, "list:accounts", map[string]interface{}{"List": Accounts, "Title": "ACME"})
 	}
 }
 
@@ -1924,15 +2933,11 @@ func accountHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vars := mux.Vars(r)
-	id, err := strconv.Atoi(vars["id"])
-	if err != nil {
-		errorHandler(w, r, err, http.StatusBadRequest)
-		return
-	}
+	id := vars["id"]
 
 	AccountDetails, err := GetAccount(w, r, id)
 	if err == nil {
-		render(w, r, "show:accounts", map[string]interface{}{"Details": AccountDetails})
+		render(w, r, "show:accounts", map[string]interface{}{"Details": AccountDetails, "Title": "ACME"})
 	}
 }
 
@@ -1942,9 +2947,9 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	Orders, err := GetOrders(w, r)
+	Orders, err := GetOrders(w, r, "")
 	if err == nil {
-		render(w, r, "list:orders", map[string]interface{}{"List": Orders})
+		render(w, r, "list:orders", map[string]interface{}{"List": Orders, "Title": "ACME"})
 	}
 }
 
@@ -1955,15 +2960,11 @@ func orderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vars := mux.Vars(r)
-	id, err := strconv.Atoi(vars["id"])
-	if err != nil {
-		errorHandler(w, r, err, http.StatusBadRequest)
-		return
-	}
+	id := vars["id"]
 
 	OrderDetails, err := GetOrder(w, r, id)
 	if err == nil {
-		render(w, r, "show:orders", map[string]interface{}{"Details": OrderDetails})
+		render(w, r, "show:orders", map[string]interface{}{"Details": OrderDetails, "Title": "ACME"})
 	}
 }
 
@@ -1973,9 +2974,9 @@ func authzHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	Authz, err := GetAuthz(w, r)
+	Authz, err := GetAuthzs(w, r, "", []string{})
 	if err == nil {
-		render(w, r, "list:authz", map[string]interface{}{"List": Authz})
+		render(w, r, "list:authz", map[string]interface{}{"List": Authz, "Title": "ACME"})
 	}
 }
 
@@ -1988,9 +2989,9 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	AuthDetails, err := GetAuth(w, r, id)
+	AuthDetails, err := GetAuthz(w, r, id)
 	if err == nil {
-		render(w, r, "show:authz", map[string]interface{}{"Details": AuthDetails})
+		render(w, r, "show:authz", map[string]interface{}{"Details": AuthDetails, "Title": "ACME"})
 	}
 }
 
@@ -2000,9 +3001,9 @@ func challengesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	Challenges, err := GetChallenges(w, r)
+	Challenges, err := GetChallenges(w, r, "", []string{})
 	if err == nil {
-		render(w, r, "list:challenges", map[string]interface{}{"List": Challenges})
+		render(w, r, "list:challenges", map[string]interface{}{"List": Challenges, "Title": "ACME"})
 	}
 }
 
@@ -2013,15 +3014,11 @@ func challengeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vars := mux.Vars(r)
-	id, err := strconv.Atoi(vars["id"])
-	if err != nil {
-		errorHandler(w, r, err, http.StatusBadRequest)
-		return
-	}
+	id := vars["id"]
 
 	ChallengeDetails, err := GetChallenge(w, r, id)
 	if err == nil {
-		render(w, r, "show:challenges", map[string]interface{}{"Details": ChallengeDetails})
+		render(w, r, "show:challenges", map[string]interface{}{"Details": ChallengeDetails, "Title": "ACME"})
 	}
 }
 
@@ -2031,9 +3028,9 @@ func certificatesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	Certificates, err := GetCertificates(w, r)
+	Certificates, err := GetCertificates(w, r, "")
 	if err == nil {
-		render(w, r, "list:certificates", map[string]interface{}{"List": Certificates})
+		render(w, r, "list:certificates", map[string]interface{}{"List": Certificates, "Title": "ACME"})
 	}
 }
 
@@ -2045,20 +3042,23 @@ func certificateHandler(w http.ResponseWriter, r *http.Request) {
 
 	var serial string
 	vars := mux.Vars(r)
-	id, err := strconv.Atoi(vars["id"])
-	if err != nil {
-		serial = vars["id"]
+	id := vars["id"]
+	if viper.GetString("backend") != "step-ca" {
+		_, err := strconv.Atoi(vars["id"])
+		if err != nil {
+			serial = vars["id"]
+		}
 	}
 
 	CertificateDetails, err := GetCertificate(w, r, id, serial)
 	if err == nil {
-		render(w, r, "show:certificates", map[string]interface{}{"Details": CertificateDetails})
+		render(w, r, "show:certificates", map[string]interface{}{"Details": CertificateDetails, "Title": "ACME"})
 	}
 }
 
 func certRevokeHandler(w http.ResponseWriter, r *http.Request) {
 	if !viper.GetBool("config.complete") {
-		errorHandler(w, r, errors.New("Method not allowed at this point"), http.StatusMethodNotAllowed)
+		errorHandler(w, r, errors.New("method not allowed at this point"), http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -2069,16 +3069,19 @@ func certRevokeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		serial := r.Form.Get("serial")
-		reason, err := strconv.Atoi(r.Form.Get("reason"))
-		if err != nil {
-			errorHandler(w, r, err, http.StatusBadRequest)
-			return
-		}
+		reason := r.Form.Get("reason")
 
-		if !_hostCommand(w, r, "revoke-cert", serial, strconv.Itoa(reason)) {
+		if !_hostCommand(w, r, "revoke-cert", serial, reason) {
 			return
 		}
 	}
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	res := parseDockerStats(getLog(w, r, "stats"))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
 
 type navItem struct {
@@ -2209,20 +3212,20 @@ func activeNav(active string, uri string, requestBase string) []navItem {
 			"title": "Live view on the logs for this LabCA web application",
 		},
 	}
+	cron := navItem{
+		Name: "Cron Log",
+		Icon: "fa-clock-o",
+		Attrs: map[template.HTMLAttr]string{
+			"href":  requestBase + "/logs/cron",
+			"title": "Live view on the logs for the cron jobs for LabCA",
+		},
+	}
 	web := navItem{
-		Name: "Web Access",
+		Name: "Web Server",
 		Icon: "fa-globe",
 		Attrs: map[template.HTMLAttr]string{
 			"href":  requestBase + "/logs/web",
 			"title": "Live view on the NGINX web server access log",
-		},
-	}
-	weberr := navItem{
-		Name: "Web Error",
-		Icon: "fa-times",
-		Attrs: map[template.HTMLAttr]string{
-			"href":  requestBase + "/logs/weberr",
-			"title": "Log file for the NGINX web server error log",
 		},
 	}
 	logs := navItem{
@@ -2233,7 +3236,7 @@ func activeNav(active string, uri string, requestBase string) []navItem {
 			"title": "Log Files",
 		},
 		IsActive: strings.HasPrefix(uri, "/logs/"),
-		SubMenu:  []navItem{cert, boulder, audit, labca, web, weberr},
+		SubMenu:  []navItem{boulder, audit, cron, labca, cert, web},
 	}
 	manage := navItem{
 		Name: "Manage",
@@ -2255,7 +3258,7 @@ func activeNav(active string, uri string, requestBase string) []navItem {
 		Name: "Public Area",
 		Icon: "fa-home",
 		Attrs: map[template.HTMLAttr]string{
-			"href":  "/",
+			"href":  "http://" + viper.GetString("labca.fqdn"),
 			"title": "The non-Admin pages of this LabCA instance",
 		},
 	}
@@ -2268,6 +3271,10 @@ func activeNav(active string, uri string, requestBase string) []navItem {
 		home.Attrs["class"] = "active"
 	case "manage":
 		manage.Attrs["class"] = "active"
+	}
+
+	if viper.GetBool("standalone") {
+		return []navItem{home, acme, manage, about}
 	}
 
 	return []navItem{home, acme, logs, manage, about, public}
@@ -2283,6 +3290,10 @@ func render(w http.ResponseWriter, r *http.Request, view string, data map[string
 
 	if version != "" {
 		data["Version"] = version
+	}
+
+	if webTitle != "" {
+		data["WebTitle"] = webTitle
 	}
 
 	b, err := tmpls.Render("base.tmpl", "views/"+viewSlice[0]+".tmpl", data)
@@ -2305,12 +3316,18 @@ func authorized(next http.Handler) http.Handler {
 		if r.RequestURI == "/login" || strings.Contains(r.RequestURI, "/static/") {
 			next.ServeHTTP(w, r)
 		} else {
-			session := getSession(w, r)
+			session, _ := sessionStore.Get(r, "labca")
 			if session.Values["user"] != nil || (r.RequestURI == "/setup" && viper.Get("user.password") == nil) {
+				// Keep setting the cookie so the expiration / max-age keeps renewing
+				if err := session.Save(r, w); err != nil {
+					log.Printf("cannot save session: %s\n", err)
+				}
 				next.ServeHTTP(w, r)
 			} else {
 				session.Values["bounce"] = r.RequestURI
-				session.Save(r, w)
+				if err := session.Save(r, w); err != nil {
+					log.Printf("cannot save session: %s\n", err)
+				}
 				http.Redirect(w, r, r.Header.Get("X-Request-Base")+"/login", http.StatusFound)
 			}
 		}
@@ -2322,34 +3339,143 @@ func init() {
 		isDev = true
 	}
 
-	var err error
-	tmpls, err = templates.New().ParseDir("./templates", "templates/")
-	if err != nil {
-		panic(fmt.Errorf("Fatal error templates: %s \n", err))
-	}
-	tmpls.AddFunc("rangeStruct", RangeStructer)
+	address := flag.String("address", "", "Address to listen on (default 0.0.0.0 when using init)")
+	configFile := flag.String("config", "", "File path to the configuration file for this application")
+	init := flag.Bool("init", false, "Initialize the application for running standalone, create/update the config file")
+	port := flag.Int("port", 0, "Port to listen on (default 3000 when using init)")
+	versionFlag := flag.Bool("version", false, "Show version number and exit")
+	decrypt := flag.String("d", "", "Decrypt a value")
+	renewcrl := flag.Int("renewcrl", 0, "Check root CRL files and renew if nextUpdate is in less than this number of days")
+	flag.Parse()
 
-	viper.SetConfigName("config")
-	viper.AddConfigPath("data")
+	if *versionFlag && standaloneVersion != "" {
+		fmt.Println(standaloneVersion)
+		os.Exit(0)
+	}
+
+	if *configFile == "" {
+		viper.SetConfigName("config")
+		ex, _ := os.Executable()
+		exePath := filepath.Dir(ex)
+		path, _ := filepath.Abs(exePath + "/..")
+		configPath = path + "/data"
+		viper.AddConfigPath(configPath)
+	} else {
+		_, err := os.Stat(*configFile)
+		if errors.Is(err, fs.ErrNotExist) {
+			viper.WriteConfigAs(*configFile)
+		}
+
+		viper.AddConfigPath(filepath.Dir(*configFile))
+		configPath = filepath.Dir(*configFile)
+		viper.SetConfigName(strings.TrimSuffix(filepath.Base(*configFile), filepath.Ext(*configFile)))
+	}
 	viper.SetDefault("config.complete", false)
 	if err := viper.ReadInConfig(); err != nil {
-		panic(fmt.Errorf("Fatal error config file: %s \n", err))
+		panic(fmt.Errorf("fatal error config file: '%s'", err))
+	}
+
+	if *versionFlag && standaloneVersion == "" {
+		fmt.Println(viper.GetString("version"))
+		os.Exit(0)
+	}
+
+	if *decrypt != "" {
+		plain, err := _decrypt(*decrypt)
+		if err == nil {
+			fmt.Println(string(plain))
+			os.Exit(0)
+		} else {
+			os.Exit(1)
+		}
+	}
+
+	if *renewcrl != 0 {
+		crlFiles, err := filepath.Glob(filepath.Join(CERT_FILES_PATH, "root-*-crl.pem"))
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		for _, crlFile := range crlFiles {
+			read, err := os.ReadFile(crlFile)
+			if err != nil {
+				fmt.Printf("could not read '%s': %s\n", crlFile, err.Error())
+				os.Exit(1)
+			}
+			block, _ := pem.Decode(read)
+			if block == nil || block.Type != "X509 CRL" {
+				fmt.Println(block)
+				fmt.Println("failed to decode PEM block containing revocation list")
+				os.Exit(1)
+			}
+			crl, err := x509.ParseRevocationList(block.Bytes)
+			if err != nil {
+				fmt.Printf("could not parse revocation list: %s\n", err.Error())
+				os.Exit(1)
+			}
+
+			now := time.Now()
+			if crl.NextUpdate.Sub(now) < time.Hour*24*time.Duration(*renewcrl) {
+				fmt.Printf("renewing crl file '%s'...\n", crlFile)
+				re := regexp.MustCompile(`-(\d{2})-`)
+				match := re.FindStringSubmatch(crlFile)
+				if len(match) > 1 {
+					seqnr := match[1]
+					ci := &CertificateInfo{}
+					ci.Initialize()
+					err = ci.CeremonyRootCRL(seqnr)
+					if err == nil {
+						fmt.Printf("updated %s\n", crlFile)
+					} else {
+						fmt.Printf("could not update crl file '%s': %s\n", crlFile, err.Error())
+						os.Exit(1)
+					}
+				} else {
+					fmt.Printf("could not extract sequence number from filename '%s'\n", crlFile)
+					os.Exit(1)
+				}
+			}
+		}
+
+		os.Exit(0)
+	}
+
+	var err error
+	if *init || viper.GetBool("standalone") {
+		tmpls, err = templates.New().ParseEmbed(embeddedTemplates, "templates/")
+	} else {
+		tmpls, err = templates.New().ParseDir("./templates", "templates/")
+	}
+	if err != nil {
+		panic(fmt.Errorf("fatal error templates: '%s'", err))
 	}
 
 	if viper.Get("keys.auth") == nil {
 		key := securecookie.GenerateRandomKey(32)
 		if key == nil {
-			panic(fmt.Errorf("Fatal error random key\n"))
+			panic(fmt.Errorf("fatal error random key"))
 		}
-		viper.Set("keys.auth", key)
+		viper.Set("keys.auth", base64.StdEncoding.EncodeToString(key))
 		viper.WriteConfig()
 	}
 	if viper.Get("keys.enc") == nil {
 		key := securecookie.GenerateRandomKey(32)
 		if key == nil {
-			panic(fmt.Errorf("Fatal error random key\n"))
+			panic(fmt.Errorf("fatal error random key"))
 		}
-		viper.Set("keys.enc", key)
+		viper.Set("keys.enc", base64.StdEncoding.EncodeToString(key))
+		viper.WriteConfig()
+	}
+
+	if *init {
+		if *address != "" {
+			viper.Set("server.addr", *address)
+		}
+		if *port != 0 {
+			viper.Set("server.port", *port)
+		}
+		viper.Set("standalone", true)
 		viper.WriteConfig()
 	}
 
@@ -2376,26 +3502,127 @@ func init() {
 	dbConn = viper.GetString("db.conn")
 	dbType = viper.GetString("db.type")
 
-	version = viper.GetString("version")
+	if viper.GetBool("standalone") {
+		version = standaloneVersion
+	} else {
+		version = viper.GetString("version")
+		if version == "" {
+			version = standaloneVersion
+		}
+	}
+
+	webTitle = viper.GetString("labca.web_title")
+	if webTitle == "" {
+		webTitle = "LabCA"
+	}
+
+	a := viper.GetString("server.addr")
+	p := viper.GetInt("server.port")
+	if *address != "" && *address != viper.GetString("server.addr") {
+		a = *address
+	}
+	if *port != 0 && *port != viper.GetInt("server.port") {
+		p = *port
+	}
+	listenAddress = fmt.Sprintf("%s:%d", a, p)
 
 	updateAvailable = false
+
+	if !viper.GetBool("standalone") {
+		CheckUpgrades()
+	}
+
+	/*
+		// TODO: Still needs to be done for this!
+		// Store boulder chains if we don't have them already
+		doWrite := false
+		if viper.GetString("certs.ca") == "" {
+			caChains := getRawCAChains()
+			viper.Set("certs.ca", caChains)
+			doWrite = true
+		}
+		if viper.GetString("certs.wfe") == "" {
+			chains := getRawWFEChains()
+			viper.Set("certs.wfe", chains)
+			doWrite = true
+		}
+		if doWrite {
+			viper.WriteConfig()
+		}
+
+		// TODO: also apply from here if different?? How exaclty is a code upgrade delaing with this??
+	*/
+}
+
+type BackupResult struct {
+	Existed  bool
+	NewName  string
+	OrigName string
+}
+
+func (br BackupResult) Remove() {
+	os.Remove(br.NewName)
+}
+
+func (br BackupResult) Restore() {
+	if br.Existed {
+		os.Rename(br.NewName, br.OrigName)
+	}
+}
+
+func renameBackup(filename string) BackupResult {
+	result := BackupResult{
+		Existed: false,
+	}
+
+	if _, err := os.Stat(filename); !errors.Is(err, os.ErrNotExist) {
+		os.Remove(filename + "_BAK") // May not exist...
+		result.Existed = true
+	}
+
+	if !result.Existed {
+		return result
+	}
+
+	err := os.Rename(filename, filename+"_BAK")
+	if err != nil {
+		fmt.Printf("warning: failed to backup previous file '%s': %s\n", filename, err.Error())
+	} else {
+		result.OrigName = filename
+		result.NewName = filename + "_BAK"
+	}
+
+	return result
 }
 
 func main() {
 	tmpls.Parse()
 
-	sessionStore = sessions.NewCookieStore([]byte(viper.GetString("keys.auth")), []byte(viper.GetString("keys.enc")))
+	keys_auth, err := base64.StdEncoding.DecodeString(viper.GetString("keys.auth"))
+	if err != nil {
+		log.Fatalf("cannot decode configured 'keys.auth': %s\n", err)
+	}
+	keys_enc, err := base64.StdEncoding.DecodeString(viper.GetString("keys.enc"))
+	if err != nil {
+		log.Fatalf("cannot decode configured 'keys.enc': %s\n", err)
+	}
+	sessionStore = sessions.NewCookieStore(keys_auth, keys_enc)
 	sessionStore.Options = &sessions.Options{
 		Path:     "/",
 		MaxAge:   viper.GetInt("server.session.maxage") * 1,
 		HttpOnly: true,
+		Secure:   viper.GetBool("server.https"),
 	}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", rootHandler).Methods("GET")
+	r.HandleFunc("/stats", statsHandler).Methods("GET")
 	r.HandleFunc("/about", aboutHandler).Methods("GET")
 	r.HandleFunc("/manage", manageHandler).Methods("GET", "POST")
+	// r.HandleFunc("/manage/newissuer", manageNewIssuerHandler).Methods("GET", "POST")
+	// r.HandleFunc("/manage/newroot", manageNewRootHandler).Methods("GET", "POST")
 	r.HandleFunc("/final", finalHandler).Methods("GET")
+	r.HandleFunc("/error", showErrorHandler).Methods("GET")
 	r.HandleFunc("/login", loginHandler).Methods("GET", "POST")
 	r.HandleFunc("/logout", logoutHandler).Methods("GET")
 	r.HandleFunc("/logs/{type}", logsHandler).Methods("GET")
@@ -2416,24 +3643,48 @@ func main() {
 	r.HandleFunc("/certificates/{id}", certificateHandler).Methods("GET")
 	r.HandleFunc("/certificates/{id}", certRevokeHandler).Methods("POST")
 
+	r.PathPrefix("/backup/").Handler(http.StripPrefix("/backup/", http.FileServer(http.Dir("/opt/backup"))))
+
 	r.NotFoundHandler = http.HandlerFunc(notFoundHandler)
-	if isDev {
-		r.PathPrefix("/accounts/static/").Handler(http.StripPrefix("/accounts/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/authz/static/").Handler(http.StripPrefix("/authz/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/challenges/static/").Handler(http.StripPrefix("/challenges/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/certificates/static/").Handler(http.StripPrefix("/certificates/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/orders/static/").Handler(http.StripPrefix("/orders/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/logs/static/").Handler(http.StripPrefix("/logs/static/", http.FileServer(http.Dir("../www"))))
-		r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("../www"))))
+	if viper.GetBool("standalone") || isDev {
+		var sfs http.Handler
+		if viper.GetBool("standalone") {
+			sfs = http.FileServer(http.FS(staticFiles))
+
+			r.PathPrefix("/accounts/static/").Handler(http.StripPrefix("/accounts", sfs))
+			r.PathPrefix("/authz/static/").Handler(http.StripPrefix("/authz", sfs))
+			r.PathPrefix("/challenges/static/").Handler(http.StripPrefix("/challenges", sfs))
+			r.PathPrefix("/certificates/static/").Handler(http.StripPrefix("/certificates", sfs))
+			r.PathPrefix("/orders/static/").Handler(http.StripPrefix("/orders", sfs))
+			r.PathPrefix("/static/").Handler(sfs)
+		}
+		if isDev {
+			sfs = http.FileServer(http.Dir("static"))
+
+			r.PathPrefix("/accounts/static/").Handler(http.StripPrefix("/accounts/static/", sfs))
+			r.PathPrefix("/authz/static/").Handler(http.StripPrefix("/authz/static/", sfs))
+			r.PathPrefix("/challenges/static/").Handler(http.StripPrefix("/challenges/static/", sfs))
+			r.PathPrefix("/certs/static/").Handler(http.StripPrefix("/certs/static/", sfs))
+			r.PathPrefix("/certificates/static/").Handler(http.StripPrefix("/certificates/static/", sfs))
+			r.PathPrefix("/orders/static/").Handler(http.StripPrefix("/orders/static/", sfs))
+			r.PathPrefix("/logs/static/").Handler(http.StripPrefix("/logs/static/", sfs))
+			r.PathPrefix("/manage/static/").Handler(http.StripPrefix("/manage/static/", sfs))
+			r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", sfs))
+		}
 	}
 	r.Use(authorized)
 
-	log.Printf("Listening on %s:%d...\n", viper.GetString("server.addr"), viper.GetInt("server.port"))
-	srv := &http.Server{
+	log.Printf("Listening on %s...\n", listenAddress)
+	srv = &http.Server{
 		Handler:      r,
-		Addr:         viper.GetString("server.addr") + ":" + viper.GetString("server.port"),
+		Addr:         listenAddress,
 		WriteTimeout: 15 * time.Second,
 		ReadTimeout:  15 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+
+	if viper.GetBool("server.https") {
+		log.Fatal(srv.ListenAndServeTLS(viper.GetString("server.cert"), viper.GetString("server.key")))
+	} else {
+		log.Fatal(srv.ListenAndServe())
+	}
 }

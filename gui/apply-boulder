@@ -2,62 +2,218 @@
 
 set -e
 
-perl -i -p0e "s/(\"dnsResolvers\": \[\n).*?(\s+\],)/\1      \"$PKI_DNS\"\2/igs" config/va.json
-perl -i -p0e "s/(\"dnsResolvers\": \[\n).*?(\s+\],)/\1      \"$PKI_DNS\"\2/igs" config/va-remote-a.json
-perl -i -p0e "s/(\"dnsResolvers\": \[\n).*?(\s+\],)/\1      \"$PKI_DNS\"\2/igs" config/va-remote-b.json
-perl -i -p0e "s/(\"dnsResolvers\": \[\n).*?(\s+\],)/\1      \"$PKI_DNS\"\2/igs" config/bad-key-revoker.json
-perl -i -p0e "s/(\"dnsResolvers\": \[\n).*?(\s+\],)/\1      \"$PKI_DNS\"\2/igs" config/expiration-mailer.json
+baseDir=$(cd $(dirname $0) && pwd)
+dataDir="$baseDir/data"
+
+PKI_DNS=$(grep "\"dns\"" $dataDir/config.json | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+if [ "$PKI_DNS" == "" ]; then
+    PKI_DNS="10.55.55.10:53"
+fi
+PKI_FQDN=$(grep fqdn $dataDir/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
+PKI_DOMAIN=$(echo $PKI_FQDN | perl -p0e 's/.*?\.//')
+PKI_DOMAIN_MODE=$(grep domain_mode $dataDir/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
+PKI_LOCKDOWN_DOMAINS=$(grep lockdown $dataDir/config.json | grep -v domain_mode | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
+PKI_WHITELIST_DOMAINS=$(grep whitelist $dataDir/config.json | grep -v domain_mode | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
+PKI_ROOT_CERT_BASE="/opt/boulder/labca/certs/webpki/root-01-cert"
+PKI_INT_CERT_BASE="/opt/boulder/labca/certs/webpki/issuer-01-cert"
+PKI_ISSUER_NAME_ID=$(grep issuer_name_id $dataDir/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/,//g' | sed -e 's/\"//g')
+if [ -z "$PKI_ISSUER_NAME_ID" ] && [ -e "$PKI_INT_CERT_BASE.pem" ]; then
+    nmid=$(/opt/boulder/bin/nameid -s $PKI_INT_CERT_BASE.pem)
+    if [ $? == 0 ]; then
+        PKI_ISSUER_NAME_ID=$nmid
+        sed -i -e "s/\(^\s*\)\(\"keys\": {\)/\1\"issuer_name_id\": $PKI_ISSUER_NAME_ID,\n\1\2/g" $dataDir/config.json
+    fi
+fi
+extended_timeout=$(grep extended_timeout $dataDir/config.json | grep true || echo "")
+if [ "$extended_timeout" != "" ]; then
+    PKI_EXTENDED_TIMEOUT=1
+else
+    PKI_EXTENDED_TIMEOUT=0
+fi
+enabled=$(grep "email\": {" $dataDir/config.json -A1 | grep enable | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+if [ "$enabled" == "true," ]; then
+    PKI_EMAIL_SERVER=$(grep server $dataDir/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    PKI_EMAIL_PORT=$(grep port $dataDir/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    PKI_EMAIL_USER=$(grep user $dataDir/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    PKI_EMAIL_PASS=$(grep pass $dataDir/config.json | grep -v password | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    pwd=""
+    if [ -e $baseDir/bin/labca-gui ]; then
+        pwd=$([ -e ] && $baseDir/bin/labca-gui -config $dataDir/config.json -d $PKI_EMAIL_PASS || echo "")
+    elif [ -e $baseDir/bin/labca-gui_prev ]; then
+        pwd=$([ -e ] && $baseDir/bin/labca-gui_prev -config $dataDir/config.json -d $PKI_EMAIL_PASS || echo "")
+    fi
+    PKI_EMAIL_PASS=$pwd
+    PKI_EMAIL_FROM=$(grep from $dataDir/config.json | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    PKI_EMAIL_TRUST=$(grep trust_root $dataDir/config.json | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+    if [ "$PKI_EMAIL_TRUST" == "private" ]; then
+        PKI_EMAIL_TRUST="labca/certs/webpki/root-01-cert.pem"
+    elif [ "$PKI_EMAIL_TRUST" == "skip" ]; then
+        PKI_EMAIL_TRUST="InsecureSkipVerify"
+    else
+        PKI_EMAIL_TRUST=""
+    fi
+else
+    PKI_EMAIL_SERVER="localhost"
+    PKI_EMAIL_PORT="9380"
+    PKI_EMAIL_USER="cert-manager@example.com"
+    PKI_EMAIL_PASS="password"
+    PKI_EMAIL_FROM="Expiry bot <test@example.com>"
+    PKI_EMAIL_TRUST="labca/certs/ipki/minica.pem"
+fi
+
+
+perl -i -p0e "s/(\"dnsStaticResolvers\": \[\n).*?(\s+\],)/\1\t\t\t\"$PKI_DNS\"\2/igs" config/remoteva-a.json
+perl -i -p0e "s/(\"dnsStaticResolvers\": \[\n).*?(\s+\],)/\1\t\t\t\"$PKI_DNS\"\2/igs" config/remoteva-b.json
+perl -i -p0e "s/(\"dnsStaticResolvers\": \[\n).*?(\s+\],)/\1\t\t\t\"$PKI_DNS\"\2/igs" config/va.json
+perl -i -p0e "s/(\"dnsStaticResolvers\": \[\n).*?(\s+\],)/\1\t\t\t\"$PKI_DNS\"\2/igs" config/bad-key-revoker.json
+perl -i -p0e "s/(\"dnsStaticResolvers\": \[\n).*?(\s+\],)/\1\t\t\t\"$PKI_DNS\"\2/igs" config/expiration-mailer.json
+for fl in $(grep -Rl maxConnectionAge config/); do
+    perl -i -p0e "s/(\s+\"maxConnectionAge\":[^\n]+)//igs" $fl
+done
+sed -i -e "s/\"issuerDomain\": \".*\"/\"issuerDomain\": \"$PKI_DOMAIN\"/" config/remoteva-a.json
+sed -i -e "s/\"issuerDomain\": \".*\"/\"issuerDomain\": \"$PKI_DOMAIN\"/" config/remoteva-b.json
 sed -i -e "s/\"issuerDomain\": \".*\"/\"issuerDomain\": \"$PKI_DOMAIN\"/" config/va.json
-sed -i -e "s/\"issuerDomain\": \".*\"/\"issuerDomain\": \"$PKI_DOMAIN\"/" config/va-remote-a.json
-sed -i -e "s/\"issuerDomain\": \".*\"/\"issuerDomain\": \"$PKI_DOMAIN\"/" config/va-remote-b.json
-sed -i -e "s/\"directoryCAAIdentity\": \".*\"/\"directoryCAAIdentity\": \"$PKI_DOMAIN\"/" config/wfe.json
 sed -i -e "s/\"directoryCAAIdentity\": \".*\"/\"directoryCAAIdentity\": \"$PKI_DOMAIN\"/" config/wfe2.json
+
+if ([ "$PKI_DOMAIN_MODE" == "lockdown" ] && [ "$PKI_LOCKDOWN_DOMAINS" != "" ]) || ([ "$PKI_DOMAIN_MODE" == "whitelist" ] && [ "$PKI_WHITELIST_DOMAINS" != "" ]); then
+    perl -i -p0e "s/(\"badResultsOnly\":[^\n]*).*?(\s+)(\"checkPeriod\":)/\1\2\"skipForbiddenDomains\": true,\2\3/igs" config/cert-checker.json
+    perl -i -p0e "s/(\"ignoredLints\": \[).*?(\s+)(\"w_subject_common_name_included\")/\1\2\"e_dnsname_not_valid_tld\",\2\"w_sub_cert_aia_contains_internal_names\",\2\3/igs" config/cert-checker.json
+    perl -i -p0e "s/(\"ignoredLints\": \[).*?(\s+)(\"w_subject_common_name_included\")/\1\2\"e_dnsname_not_valid_tld\",\2\"w_sub_cert_aia_contains_internal_names\",\2\3/igs" config/ca.json
+
+    perl -i -p0e "s/(\"SubscriberKeyUsageValidator:cabf.serverauth.subscriber_rsa_digitalsignature_and_keyencipherment_present\",).*(\])/\1\n  \"GeneralNameDnsNameInternalDomainNameValidator:cabf.internal_domain_name\",\n  \"GeneralNameUriInternalDomainNameValidator:cabf.internal_domain_name\",\n\2/igs" config/zlint.toml
+fi
 
 [ -e ../test/hostname-policy.yaml ] && cp ../test/hostname-policy.yaml ./ || true
 [ -e ../boulder/test/hostname-policy.yaml ] && cp ../boulder/test/hostname-policy.yaml ./ || true
 [ -e hostname-policy.json ] && rm hostname-policy.json || true
-if [ "$PKI_DOMAIN_MODE" == "lockdown" ]; then
+[ -e config/expired-authz-purger2.json ] && rm config/expired-authz-purger2.json || true
+[ -e config/janitor.json ] && rm config/janitor.json || true
+cat hostname-policy.yaml | tr '\n' '\r' | sed -e "s/\r# Lockdown.*//" | tr '\r' '\n' > hostname-policy.yaml.bak && mv hostname-policy.yaml.bak hostname-policy.yaml
+cat hostname-policy.yaml | tr '\n' '\r' | sed -e "s/\r# Whitelist.*//" | tr '\r' '\n' > hostname-policy.yaml.bak && mv hostname-policy.yaml.bak hostname-policy.yaml
+if [ "$PKI_DOMAIN_MODE" == "lockdown" ] && [ "$PKI_LOCKDOWN_DOMAINS" != "" ]; then
+    echo >> hostname-policy.yaml
+    echo "# Lockdown are the domains that this LabCA instance can issue certificates for" >> hostname-policy.yaml
     echo "Lockdown:" >> hostname-policy.yaml
-    echo "  - \"$PKI_LOCKDOWN_DOMAINS\"" >> hostname-policy.yaml
+    for d in $(echo $PKI_LOCKDOWN_DOMAINS | sed -e "s/\\\r/ /g" | sed -e "s/\\\n/ /g" | tr '\r' ' '); do
+        echo "  - \"$d\"" >> hostname-policy.yaml
+    done
+
+    allow_public="false"
+    ld_public_contacts=$(grep ld_public_contacts $dataDir/config.json | grep true || echo "")
+    if [ "$ld_public_contacts" != "" ]; then
+        allow_public="true"
+    fi
+
+    echo >> hostname-policy.yaml
+    echo "LockdownAllowPublicContacts: $allow_public" >> hostname-policy.yaml
 fi
-if [ "$PKI_DOMAIN_MODE" == "whitelist" ]; then
+if [ "$PKI_DOMAIN_MODE" == "whitelist" ] && [ "$PKI_WHITELIST_DOMAINS" != "" ]; then
+    echo >> hostname-policy.yaml
+    echo "# Whitelist are the domains that this LabCA instance can issue certificates for" >> hostname-policy.yaml
+    echo "# in *addition* to all normal public domains" >> hostname-policy.yaml
     echo "Whitelist:" >> hostname-policy.yaml
-    echo "  - \"$PKI_LOCKDOWN_DOMAINS\"" >> hostname-policy.yaml
+    for d in $(echo $PKI_WHITELIST_DOMAINS | sed -e "s/\\\r/ /g" | sed -e "s/\\\n/ /g" | tr '\r' ' '); do
+        echo "  - \"$d\"" >> hostname-policy.yaml
+    done
 fi
 if [ "$PKI_DOMAIN_MODE" == "lockdown" ] || [ "$PKI_DOMAIN_MODE" == "whitelist" ]; then
-    sed -i -e "s/^\(.*\)\(\"n_subject_common_name_included\"\)/\1\2,\n\1\"e_dnsname_not_valid_tld\"/" config/ca-a.json
-    sed -i -e "s/^\(.*\)\(\"n_subject_common_name_included\"\)/\1\2,\n\1\"e_dnsname_not_valid_tld\"/" config/ca-b.json
+    sed -i -e "s/\(\"w_subject_common_name_included\"\).*\]/\1,\"e_dnsname_not_valid_tld\"\]/" config/ca.json
+
+    REPLACEMENT=""
+    LABCA_DOMAINS=""
+    if [ "$PKI_DOMAIN_MODE" == "lockdown" ] && [ "$PKI_LOCKDOWN_DOMAINS" != "" ]; then
+        for d in $(echo $PKI_LOCKDOWN_DOMAINS | sed -e "s/\\\r/ /g" | sed -e "s/\\\n/ /g" | tr '\r' ' '); do
+            REPLACEMENT+="    $d: 10000\r"
+            if [ "$LABCA_DOMAINS" != "" ]; then
+                LABCA_DOMAINS+=",\n"
+            fi
+            LABCA_DOMAINS+="\t\t\t\"$d\""
+        done
+    fi
+    if [ "$PKI_DOMAIN_MODE" == "whitelist" ] && [ "$PKI_WHITELIST_DOMAINS" != "" ]; then
+        for d in $(echo $PKI_WHITELIST_DOMAINS | sed -e "s/\\\r/ /g" | sed -e "s/\\\n/ /g" | tr '\r' ' '); do
+            REPLACEMENT+="    $d: 10000\r"
+            if [ "$LABCA_DOMAINS" != "" ]; then
+                LABCA_DOMAINS+=",\n"
+            fi
+            LABCA_DOMAINS+="\t\t\t\"$d\""
+        done
+    fi
+    cat rate-limit-policies.yml | tr '\n' '\r' | sed -e "s/\(must-staple.le.wtf: 10000\).*\(  registrationOverrides:\)/\1\n$REPLACEMENT\2/" | tr '\r' '\n' > rate-limit-policies.yml.bak && mv rate-limit-policies.yml.bak rate-limit-policies.yml
+    cat rate-limit-policies.yml | tr '\n' '\r' | sed -e "s|\(certificatesPerFQDNSet:.*must-staple.le.wtf: 10000\).*\(certificatesPerFQDNSetFast:.*\)|\1\n${REPLACEMENT}rateLimitsURL: http://$PKI_FQDN/rate-limits\n\2|" | tr '\r' '\n' > rate-limit-policies.yml.bak && mv rate-limit-policies.yml.bak rate-limit-policies.yml
+
+    perl -i -p0e "s/(\"labcaDomains\": \[\n).*?(\])/\1$LABCA_DOMAINS\n\t\t\2/igs" config/remoteva-a.json
+    perl -i -p0e "s/(\"labcaDomains\": \[\n).*?(\])/\1$LABCA_DOMAINS\n\t\t\2/igs" config/remoteva-b.json
+    perl -i -p0e "s/(\"labcaDomains\": \[\n).*?(\])/\1$LABCA_DOMAINS\n\t\t\2/igs" config/va.json
 fi
 
+CRLINT=24h
+CRLLIFE=96h
+CRLCONF=$(grep crl_interval $dataDir/config.json | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
+if [ "$CRLCONF" != "" ]; then
+    CRLINT=$(echo $CRLCONF | cut -d "|" -f 1)
+    CRLLIFE=$(echo $CRLCONF | cut -d "|" -f 2)
+fi
+sed -i -e "s/\"shardWidth\": \".*\"/\"shardWidth\": \"$CRLINT\"/" config/crl-updater.json
+sed -i -e "s/\"updatePeriod\": \".*\"/\"updatePeriod\": \"$CRLINT\"/" config/crl-updater.json
+sed -i -e "s/\"lookbackPeriod\": \".*\"/\"lookbackPeriod\": \"$CRLLIFE\"/" config/crl-updater.json
+sed -i -e "s/\"lifespanCRL\": \".*\"/\"lifespanCRL\": \"$CRLLIFE\"/" config/ca.json
+rm -f config/contact-exporter.json
+rm -f config/nonce.json
+rm -f config/ocsp-updater.json
+rm -f config/wfe.json
+rm -f config/orphan-finder.json
+rm -f config/ca-a.json
+rm -f config/ca-b.json
+
+INT_BASE_NAME=$(basename $PKI_INT_CERT_BASE.pem)
+sed -i -e "s|\"issuerURL\": \".*\"|\"issuerURL\": \"http://$PKI_FQDN/certs/$INT_BASE_NAME\"|" config/ca.json
+sed -i -e "s|\"ocspURL\": \".*\"|\"ocspURL\": \"http://$PKI_FQDN/ocsp/\"|" config/ca.json
+sed -i -e "s|\"crlURLBase\": \".*\"|\"crlURLBase\": \"http://$PKI_FQDN/crl/\"|" config/ca.json
+
 if [ "$PKI_EXTENDED_TIMEOUT" == "1" ]; then
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ca-a.json
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ca-b.json
+    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ca.json
     sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/admin-revoker.json
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/wfe.json
-    sed -i -e "s/\"timeout\": \"20s\"/\"timeout\": \"40s\"/" config/wfe.json
     sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/wfe2.json
     sed -i -e "s/\"timeout\": \"20s\"/\"timeout\": \"40s\"/" config/wfe2.json
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ca.json
     sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/expiration-mailer.json
     sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ra.json
     sed -i -e "s/\"timeout\": \"20s\"/\"timeout\": \"40s\"/" config/ra.json
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/ocsp-updater.json
-    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/orphan-finder.json
+    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/crl-storer.json
+    sed -i -e "s/\"timeout\": \"15s\"/\"timeout\": \"30s\"/" config/crl-updater.json
+
+    sed -i -e "s/pkilint_timeout = .*/pkilint_timeout = 30000000000 # 30 seconds/" config/zlint.toml
+else
+    sed -i -e "s/pkilint_timeout = .*/pkilint_timeout = 10000000000 # 10 seconds/" config/zlint.toml
 fi
+sed -i -e "s/\"timeout\": \"1s\"/\"timeout\": \"5s\"/" config/health-checker.json
 
 sed -i -e "s/\"server\": \".*\"/\"server\": \"$PKI_EMAIL_SERVER\"/" config/bad-key-revoker.json
 sed -i -e "s/\"port\": \".*\"/\"port\": \"$PKI_EMAIL_PORT\"/" config/bad-key-revoker.json
 sed -i -e "s/\"username\": \".*\"/\"username\": \"$PKI_EMAIL_USER\"/" config/bad-key-revoker.json
 sed -i -e "s/\"from\": \".*\"/\"from\": \"$PKI_EMAIL_FROM\"/" config/bad-key-revoker.json
+sed -i -e "s|\"SMTPTrustedRootFile\": \".*\"|\"SMTPTrustedRootFile\": \"$PKI_EMAIL_TRUST\"|" config/bad-key-revoker.json
 sed -i -e "s/\"server\": \".*\"/\"server\": \"$PKI_EMAIL_SERVER\"/" config/expiration-mailer.json
 sed -i -e "s/\"port\": \".*\"/\"port\": \"$PKI_EMAIL_PORT\"/" config/expiration-mailer.json
 sed -i -e "s/\"username\": \".*\"/\"username\": \"$PKI_EMAIL_USER\"/" config/expiration-mailer.json
 sed -i -e "s/\"from\": \".*\"/\"from\": \"$PKI_EMAIL_FROM\"/" config/expiration-mailer.json
+sed -i -e "s|\"SMTPTrustedRootFile\": \".*\"|\"SMTPTrustedRootFile\": \"$PKI_EMAIL_TRUST\"|" config/expiration-mailer.json
 sed -i -e "s/\"server\": \".*\"/\"server\": \"$PKI_EMAIL_SERVER\"/" config/notify-mailer.json
 sed -i -e "s/\"port\": \".*\"/\"port\": \"$PKI_EMAIL_PORT\"/" config/notify-mailer.json
 sed -i -e "s/\"username\": \".*\"/\"username\": \"$PKI_EMAIL_USER\"/" config/notify-mailer.json
 sed -i -e "s/\"from\": \".*\"/\"from\": \"$PKI_EMAIL_FROM\"/" config/notify-mailer.json
+sed -i -e "s|\"SMTPTrustedRootFile\": \".*\"|\"SMTPTrustedRootFile\": \"$PKI_EMAIL_TRUST\"|" config/notify-mailer.json
+
 sed -i -e "s/\"purgeInterval\": \".*\"/\"purgeInterval\": \"1s\"/" config/akamai-purger.json
+
+for fl in $(grep -Rl maxOpenConns config/); do
+    set +e
+    m=$(grep "connMaxIdleTime" $fl)
+    set -e
+    if [ -z "$m" ]; then
+        perl -i -p0e "s/([ \t]+)(\"maxOpenConns\": .*)/\1\2,\n\1\"connMaxIdleTime\": \"30s\"/g" $fl
+    fi
+done
 
 if [ "$PKI_EMAIL_PASS" != "" ]; then
     sed -i -e "s/.*/$PKI_EMAIL_PASS/" secrets/smtp_password
@@ -74,15 +230,8 @@ rm -f test-root.pem
 rm -f test-root.der
 rm -f test-root.p8
 
-cp -p $PKI_INT_CERT_BASE.key test-ca.key
-cp -p $PKI_INT_CERT_BASE.key.der test-ca.key.der
-cp -p $PKI_INT_CERT_BASE.pem test-ca.pem
-openssl rsa -in $PKI_INT_CERT_BASE.key -pubout > test-ca.pubkey.pem
-openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in test-ca.key -out test-ca.p8
-cp -p $PKI_ROOT_CERT_BASE.key test-root.key
-cp -p $PKI_ROOT_CERT_BASE.key.der test-root.key.der
-cp -p $PKI_ROOT_CERT_BASE.pem test-root.pem
-openssl rsa -in $PKI_ROOT_CERT_BASE.key -pubout > test-root.pubkey.pem
-openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in test-root.key -out test-root.p8
+chown -R `ls -l helpers.py | cut -d" " -f 3,4 | sed 's/ /:/g'` .
 
-chown -R `ls -l rate-limit-policies.yml | cut -d" " -f 3,4 | sed 's/ /:/g'` .
+if [ -e $PKI_INT_CERT_BASE.pem ] && [ -e $PKI_ROOT_CERT_BASE.pem ]; then
+    [ -f setup_complete ] || touch setup_complete
+fi

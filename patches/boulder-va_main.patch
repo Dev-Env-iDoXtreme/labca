@@ -1,0 +1,22 @@
+diff --git a/cmd/boulder-va/main.go b/cmd/boulder-va/main.go
+index f2c2c8487..86fb29457 100644
+--- a/cmd/boulder-va/main.go
++++ b/cmd/boulder-va/main.go
+@@ -56,6 +56,7 @@ type Config struct {
+ 		// Deprecated and ignored
+ 		MaxRemoteValidationFailures int `validate:"omitempty,min=0,required_with=RemoteVAs"`
+ 		Features                    features.Config
++		LabCADomains                []string
+ 	}
+ 
+ 	Syslog        cmd.SyslogConfig
+@@ -153,7 +154,8 @@ func main() {
+ 		logger,
+ 		c.VA.AccountURIPrefixes,
+ 		va.PrimaryPerspective,
+-		"")
++		"",
++		c.VA.LabCADomains)
+ 	cmd.FailOnError(err, "Unable to create VA server")
+ 
+ 	start, err := bgrpc.NewServer(c.VA.GRPC, logger).Add(

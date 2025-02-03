@@ -1,40 +1,51 @@
 #!/usr/bin/env bash
 
 # LabCA: a private Certificate Authority for internal lab usage
-# (c) 2018 Arjan Hakkesteegt
+# (c) 2018-2025 Arjan Hakkesteegt
 #
-# Install with this command from a Linux machine (only tested with Debian 9):
+# Install with this command from a Linux machine (only tested with Debian and Ubuntu):
 # curl -sSL https://raw.githubusercontent.com/hakwerk/labca/master/install | bash
 
-set -e
+set -eEo pipefail
+trap 'err_report $? $LINENO' INT TERM ERR
+
+err_report() {
+    msg_fatal "return code $1 on line $2 in $(basename $0)" $1
+}
 
 #
 # Variables / Constants
 #
-baseDir=/home/labca
-logDir="$baseDir/logs"
+installMode=${installMode:-normal}
+baseDir=${baseDir:-/home/labca}
+logDir=${logDir:-"$baseDir/logs"}
 runId="`date +%y%m%d-%H%M%S`"
 installLog="$logDir/install-${runId}.log"
 logTimeFormat="+%Y-%m-%d %T.%3N"
-cloneDir="$baseDir/labca"
-adminDir="$baseDir/admin"
-boulderDir="$baseDir/boulder"
-boulderLabCADir="${boulderDir}_labca"
-dockerComposeVersion="1.22.0"
+cloneDir=${cloneDir:-"$baseDir/labca"}
+adminDir=${adminDir:-"$baseDir/admin"}
+boulderDir=${boulderDir:-"$baseDir/boulder"}
+boulderLabCADir=${boulderLabCADir:-"${boulderDir}_labca"}
+dockerComposeVersion="v2.5.0"
 
 labcaUrl="https://github.com/hakwerk/labca/"
 boulderUrl="https://github.com/letsencrypt/boulder/"
-boulderTag="release-2020-09-09"
+boulderTag="release-2025-01-06"
+
+# Feature flags
+flag_skip_redis=true
 
 #
 # Color configuration
 #
 COL_NC='\e[0m' # No Color
 COL_LIGHT_GREEN='\e[1;32m'
+COL_YELLOW='\e[1;33m'
 COL_LIGHT_RED='\e[1;31m'
 TICK="[${COL_LIGHT_GREEN}✓${COL_NC}]"
 CROSS="[${COL_LIGHT_RED}✗${COL_NC}]"
-INFO="[i]"
+WARN="[${COL_YELLOW}✠${COL_NC}]"
+INFO="[.]"
 DONE="${COL_LIGHT_GREEN} done!${COL_NC}"
 OVER="\\r\\033[K"
 
@@ -45,12 +56,19 @@ wait_down() {
 wait_up() {
     sleep 5
 }
+count() {
+    echo 0
+}
 
 dn=$(dirname $0)
 source "$dn/utils.sh" &>/dev/null || true
 
 cmdlineFqdn=""
 cmdlineBranch=""
+fullCmdline=""
+keepLocal=0
+alphaTest=0
+dcdowngraded=0
 
 #
 # Helper functions for informing the user and logging to file
@@ -67,6 +85,12 @@ msg_ok() {
     echo "[`date "${logTimeFormat}"`] [OK   ] ${msg}" >> $installLog
 }
 
+msg_warn() {
+    local msg="$1"
+    echo -e "${OVER}  ${WARN} ${msg}"
+    echo "[`date "${logTimeFormat}"`] [WARN] ${msg}" >> $installLog
+}
+
 msg_err() {
     local msg="$1"
     echo -e "${OVER}  ${CROSS} ${msg}"
@@ -77,7 +101,7 @@ msg_fatal() {
     local msg="$1"
     echo -e "\\n  ${COL_LIGHT_RED}Error: ${msg}${COL_NC}\\n"
     echo "[`date "${logTimeFormat}"`] [FATAL] ${msg}" >> $installLog
-    exit 1
+    exit ${2:-1}
 }
 
 #
@@ -85,7 +109,7 @@ msg_fatal() {
 #
 start_temporary_log() {
     backupLog=$installLog
-    installLog="/tmp/labca-install.log"
+    installLog="/tmp/labca-install-$$.log"
     touch "$installLog"
 }
 
@@ -121,16 +145,16 @@ labca_user() {
     chown -R labca:labca "$logDir"
 
     cd ~labca
-    local gig=$(sudo -u labca git config --global core.excludesfile 2>/dev/null)
+    local gig=$(sudo -u labca -H git config --global core.excludesfile 2>/dev/null)
     if [ -z "$gig" ]; then
-        sudo -u labca git config --global core.excludesfile /home/labca/.gitignore_global >/dev/null 2>&1 || msg_info "WARNING: could not set core.excludesfile"
-        gig=$(sudo -u labca git config --global core.excludesfile 2>/dev/null)
+        sudo -u labca -H git config --global core.excludesfile /home/labca/.gitignore_global >/dev/null 2>&1 || msg_warn "WARNING: could not set core.excludesfile"
+        gig=$(sudo -u labca -H git config --global core.excludesfile 2>/dev/null)
     fi
     gig=${gig/\~/\/home\/labca}
     gig=${gig:-/home/labca/.gitignore_global}
 
-    [ -e "$gig" ] || sudo -u labca touch $gig
-    sudo -u labca grep config_labca "$gig" >/dev/null 2>&1 || sudo -u labca echo "config_labca/" >> "$gig"
+    [ -e "$gig" ] || sudo -u labca -H touch $gig
+    sudo -u labca -H grep config_labca "$gig" >/dev/null 2>&1 || sudo -u labca -H echo "config_labca/" >> "$gig"
 }
 
 #
@@ -143,11 +167,11 @@ clone_repo() {
 
     local msg="Clone $url to $dir"
     msg_info "$msg"
-    sudo -u labca git clone -q "$url" "$dir" &>>$installLog && msg_ok "$msg" || msg_fatal "Could not clone git repository"
+    sudo -u labca -H git clone -q "$url" "$dir" &>>$installLog && msg_ok "$msg" || msg_fatal "Could not clone git repository"
 
     if [ "$branch" != "" ]; then
         cd "$dir"
-        sudo -u labca git checkout $branch &>>$installLog
+        sudo -u labca -H git checkout $branch &>>$installLog
         cd - >/dev/null
     fi
 }
@@ -160,13 +184,20 @@ pull_repo() {
 
     local msg="Update git repository in $dir"
     msg_info "$msg"
-    sudo -u labca git stash --all --quiet &>>$installLog || true
-    sudo -u labca git clean --quiet --force -d &>>$installLog || true
-    sudo -u labca git pull --quiet &>>$installLog && msg_ok "$msg" || msg_fatal "Could not update local repository"
+    sudo -u labca -H git stash --all --quiet &>>$installLog || true
+    sudo -u labca -H git clean --quiet --force -d &>>$installLog || true
+    sudo -u labca -H git pull --quiet &>>$installLog && msg_ok "$msg" || (
+        if [ "$dir" == "$GOPATH/src/github.com/letsencrypt/boulder" ]; then
+            sudo -u labca -H git reset --hard $boulderTag &>>$installLog && msg_ok "$msg" || msg_fatal "Could not reset local repository"
+            sudo -u labca -H git pull --quiet &>>$installLog && msg_ok "$msg" || msg_fatal "Could not update local repository (after reset)"
+        else
+            msg_fatal "Could not update local repository"
+        fi
+    )
 
     if [ "$branch" != "" ]; then
         cd "$dir"
-        sudo -u labca git checkout $branch &>>$installLog
+        sudo -u labca -H git checkout $branch &>>$installLog
         cd - >/dev/null
     fi
 }
@@ -179,10 +210,20 @@ clone_or_pull() {
     local parentdir=$(dirname "$dir")
     local dirbase=$(basename "$dir")
 
+    local found=0
+    for sd in $(git config --global --get-all safe.directory); do
+        if [ "$sd" == "$dir" ]; then
+            found=1
+        fi
+    done
+    if [ $found -eq 0 ]; then
+        git config --global --add safe.directory $dir
+    fi
+
     if [ -d "$dir" ]; then
         local rc=0
         cd "$dir"
-        git status --short &> /dev/null || rc=$?
+        sudo -u labca -H git status --short &> /dev/null || rc=$?
         if [ $rc -gt 0 ]; then
             cd "$parentdir"
             mv "$dirbase" "${dirbase}_${runId}" && msg_ok "Backup existing non-git directory '$dir'"
@@ -195,10 +236,22 @@ clone_or_pull() {
     fi
 }
 
+# Checkout the latest release tag
+checkout_release() {
+    local branch="$1"
+    if [ "$branch" == "" ] || [ "$branch" == "master" ] || [ "$branch" == "main" ]; then
+        cd "$cloneDir"
+        if [ "$curChecksum" == "" ]; then
+            curChecksum=$(md5sum $cloneDir/install 2>/dev/null | cut -d' ' -f1)
+        fi
+        TAG=$(sudo -u labca -H git describe --tags $(sudo -u labca -H git rev-list --tags --max-count=1))
+        sudo -u labca -H git reset --hard $TAG &>>$installLog
+    fi
+}
+
 # Restart the script if it was updated itself
 restart_if_updated() {
-    local curChecksum="$1"
-    local gitRev=$(cd $cloneDir && git describe --always --tags)
+    local gitRev=$(cd $cloneDir && sudo -u labca -H git describe --always --tags)
     echo "=== version $gitRev ($curChecksum) ===" >>$installLog
 
     if [ "$curChecksum" != "" ]; then
@@ -206,7 +259,7 @@ restart_if_updated() {
         if [ "$curChecksum" != "$newChecksum" ]; then
             msg_info "Restarting updated version of install script"
             echo
-            exec $cloneDir/install
+            exec $cloneDir/install $fullCmdline
             exit $?
         fi
     fi
@@ -229,17 +282,30 @@ prompt_and_export() {
 
 # Parse the command line options, if any
 parse_cmdline() {
-    local parsed=$(getopt --options=n:,b: --longoptions=name:,fqdn:,branch: --name "$0" -- "$@" 2>>$installLog) || msg_fatal "Could not process commandline parameters"
+    fullCmdline="$@"
+    local parsed=$(getopt --options=n:,b:,k,t --longoptions=name:,fqdn:,branch:,keep,test --name "$0" -- "$@" 2>>$installLog) || msg_fatal "Could not process commandline parameters"
     eval set -- "$parsed"
     while true; do
         case "$1" in
             -n|--name|--fqdn)
                 cmdlineFqdn="$2"
                 shift 2
+                msg_ok "option: using FQDN name '$cmdlineFqdn'"
                 ;;
             -b|--branch)
                 cmdlineBranch="$2"
                 shift 2
+                msg_ok "option: using branch '$cmdlineBranch'"
+                ;;
+            -k|--keep)
+                keepLocal=1
+                shift 1
+                msg_ok "option: keeping local version as is"
+                ;;
+            -t|--test)
+                alphaTest=1
+                shift 1
+                msg_ok "option: build docker images locally"
                 ;;
             --)
                 shift
@@ -252,19 +318,45 @@ parse_cmdline() {
     done
 }
 
+# Utility method to check if value looks like a host + domain
+has_domain() {
+    local dom="$1"
+
+    if [[ "$dom" =~ ^\..*$ ]]; then
+        false
+    elif [[ "$dom" =~ ^.*\.$ ]]; then
+        false
+    elif [[ "$dom" =~ ^.*\..*$ ]]; then
+        true
+    else
+        false
+    fi
+}
+
 # Determine the remote address of this machine from (in order): commandline parameter,
 # existing configuration or full hostname.
 get_fqdn() {
     local cfgFile="$adminDir/data/config.json"
-    local cfgFqdn=$(grep fqdn $cfgFile 2>/dev/null | grep -v LABCA_FQDN | cut -d ":" -f 2- | tr -d " \",")
+    local cfgFqdn=$(grep fqdn $cfgFile 2>/dev/null | grep -v LABCA_FQDN | cut -d ":" -f 2- | tr -d " \"," || echo "")
     LABCA_FQDN=${cfgFqdn:-$(hostname -f)}
 
-    if [ "$cfgFqdn" == "" ]; then
+    while [ "$cfgFqdn" == "" ]; do
         if [ "$cmdlineFqdn" != "" ]; then
             export LABCA_FQDN="$cmdlineFqdn"
         else
             prompt_and_export LABCA_FQDN "$LABCA_FQDN" "FQDN (Fully Qualified Domain Name) for this PKI host (users will use this in their browsers and clients)?"
         fi
+
+        if has_domain $LABCA_FQDN; then
+            cfgFqdn="ok"
+        else
+            msg_err "FQDN must include a hostname AND a domain!"
+            cmdlineFqdn=""
+        fi
+    done
+
+    if ! has_domain $LABCA_FQDN; then
+        msg_fatal "FQDN must include a hostname AND a domain!"
     fi
 
     msg_ok "Determine web address"
@@ -289,15 +381,15 @@ copy_admin() {
 
     [ -d "$adminDir" ] || mkdir "$adminDir"
     cd "$adminDir"
+    git config --global --add safe.directory "$adminDir"
     git status --short &> /dev/null || rc=$?
     if [ $rc -gt 0 ]; then
-        git init >>$installLog
+        git init &>>$installLog
     fi
     git add --all &>/dev/null || true
     git commit --all --quiet -m "LabCA before update $runId" &>>$installLog && { msg_ok "Commit existing modifications of $adminDir"; msg_info "$msg"; } || true
 
     cp -rp $cloneDir/gui/* "./" &>>$installLog || msg_fatal "Cannot copy the admin files to $adminDir"
-    cp -p  "$cloneDir/acme_tiny.py" "/home/labca/" &>>$installLog
 
     msg_ok "$msg"
     msg="Configure the admin application"
@@ -306,17 +398,20 @@ copy_admin() {
     [ -e "$adminDir/data/config.json" ] || echo -e "{\n  \"config\": {\n    \"complete\": false\n  },\n  \"labca\": {\n    \"fqdn\": \"$LABCA_FQDN\"\n  },\n  \"version\": \"\"\n}" > "$adminDir/data/config.json"
     replace_all $adminDir/data/openssl.cnf LABCA_FQDN
     replace_all $adminDir/data/issuer/openssl.cnf LABCA_FQDN
-    replace_all /home/labca/acme_tiny.py LABCA_FQDN
 
     cd "$cloneDir"
-    version=$(git describe --always HEAD 2>/dev/null)
+    sudo -u labca -H git config --global --add safe.directory "$cloneDir"
+    version=$(sudo -u labca -H git describe --always --tags HEAD 2>/dev/null)
     cd "$adminDir"
     grep \"version\" data/config.json &>/dev/null || sed -i -e 's/^}$/,\n  "version": ""\n}/' data/config.json
     sed -i -e "s/\"version\": \".*\"/\"version\": \"$version\"/" data/config.json
-    [ ! -e bin/labca ] || mv bin/labca bin/labca_prev
+    [ ! -e bin/labca-gui ] || mv bin/labca-gui bin/labca-gui_prev
 
     chown -R labca:labca $baseDir
     chown root:root "$cloneDir/cron_d"
+
+    [ -e /etc/cron.d/labca ] && rm /etc/cron.d/labca || true
+    [ -e /etc/logrotate.d/labca ] && rm /etc/logrotate.d/labca || true
 
     git add --all &>/dev/null || true
     git commit --all --quiet -m "LabCA after update $runId" &>>$installLog || true
@@ -329,6 +424,7 @@ update_upgrade() {
     msg_info "Making sure all software is up-to-date"
     apt update &>>$installLog
     apt upgrade -y &>>$installLog
+    apt autoremove -y &>>$installLog
     msg_ok "Software is up-to-date"
 }
 
@@ -338,31 +434,51 @@ update_upgrade() {
 install_pkg() {
     local package="$1"
     msg_info "Install package '$package'"
-    apt install -y "$package" &>>$installLog || msg_fatal "Could not install package '$package'"
+    err=""
+    apt install -y "$package" &>>$installLog || err="err"
+    if [ "$err" == "err" ]; then
+        if [ "$package" == "python" ]; then
+            package="python3"
+            apt install -y "$package" &>>$installLog || msg_fatal "Could not install package '$package'"
+        else
+            msg_fatal "Could not install package '$package'"
+        fi
+    fi
     msg_ok "Package '$package' is installed"
 }
 
 install_extra() {
-    local packages=(apt-transport-https ca-certificates curl gnupg2 net-tools nginx software-properties-common tzdata ucspi-tcp zip)
+    local packages=(apt-transport-https ca-certificates curl gnupg net-tools tzdata ucspi-tcp zip unzip python lsb-release)
     for package in "${packages[@]}"; do
         install_pkg "$package"
     done
 
-    curl -fsSL https://download.docker.com/linux/debian/gpg 2>>$installLog | apt-key add - &>>$installLog || msg_fatal "Could not download docker repository key"
-    add-apt-repository -r "deb [arch=amd64] https://download.docker.com/linux/debian $(lsb_release -cs) stable" &>>$installLog
-    add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian $(lsb_release -cs) stable" &>>$installLog
-    apt update &>>$installLog
-    install_pkg "docker-ce"
+    distrib=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+    install -m 0755 -d /etc/apt/keyrings
+    [ ! -e /etc/apt/keyrings/docker.gpg ] || mv /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.gpg_PREV
+    curl -fsSL https://download.docker.com/linux/${distrib}/gpg 2>>$installLog | gpg --dearmor -o /etc/apt/keyrings/docker.gpg &>>$installLog || msg_fatal "Could not download docker repository key"
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo \
+      "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${distrib} \
+      "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null &>>$installLog
+    apt-get update &>>$installLog
+    local packages=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+    for package in "${packages[@]}"; do
+        install_pkg "$package"
+    done
 
-    msg_info "Install binary 'docker-compose'"
-    local dcver=""
-    [ -x /usr/local/bin/docker-compose ] && dcver="`/usr/local/bin/docker-compose --version`"
-    local vercmp=${dcver/$dockerComposeVersion/}
-    if [ "$dcver" == "$vercmp" ]; then
-        curl -sSL https://github.com/docker/compose/releases/download/$dockerComposeVersion/docker-compose-`uname -s`-`uname -m` -o /usr/local/bin/docker-compose &>>$installLog || msg_fatal "Could not download docker-compose"
-        chmod +x /usr/local/bin/docker-compose
+    dcver=$(docker compose version | grep v2.19 | wc -l)
+    if [ "$dcver" != "0" ]; then
+        dc18=$(apt list docker-compose-plugin -a 2>/dev/null | grep 2.18 | cut -d ' ' -f 2)
+        apt install -y --allow-downgrades docker-compose-plugin=${dc18} &>>$installLog
+        dcdowngraded=1
+
+        msg_warn "docker-compose-plugin was downgraded to v2.18 due to a known bug with v2.19.x"
     fi
-    msg_ok "Binary 'docker-compose' is installed"
+
+    # Make sure the labca user has docker permissions
+    usermod -aG docker labca
 }
 
 # Configure the static web pages (for end users)
@@ -371,33 +487,42 @@ static_web() {
 
     local msg="Static web pages"
     msg_info "$msg"
-    [ -e /etc/nginx/sites-available/labca ] || cp $cloneDir/nginx.conf /etc/nginx/sites-available/labca
-    [ -e /etc/nginx/sites-enabled/labca ] || ln -s ../sites-available/labca /etc/nginx/sites-enabled/
-    rm -f /etc/nginx/sites-enabled/default
+    if [ -d /etc/nginx ] && [ ! -d /etc/nginx.backup ]; then
+        # Migrate cert from host nginx to dockerized nginx
+        [ -d /home/labca/nginx_data/ssl ] || mkdir -p /home/labca/nginx_data/ssl
+        [ -d /etc/nginx/ssl/ ] && mv /etc/nginx/ssl/* /home/labca/nginx_data/ssl/ || true
+        mv /etc/nginx /etc/nginx.backup
+    fi
 
-    cd /var/www/html
+    [ -d /home/labca/nginx_data/conf.d ] || mkdir -p /home/labca/nginx_data/conf.d
+    [ -d /home/labca/nginx_data/ssl ] || mkdir -p /home/labca/nginx_data/ssl
+    cp $cloneDir/nginx.conf /home/labca/nginx_data/conf.d/labca.conf
+    cp $cloneDir/proxy.inc /home/labca/nginx_data/conf.d/proxy.inc
+    if [ -f "$boulderLabCADir/setup_complete" ]; then
+        perl -i -p0e 's/\n    # BEGIN temporary redirect\n    location = \/ \{\n        return 302 \/admin\/;\n    }\n    # END temporary redirect\n//igs' /home/labca/nginx_data/conf.d/labca.conf
+    fi
+
+    [ -d /home/labca/nginx_data/static ] || mkdir /home/labca/nginx_data/static
+    cd /home/labca/nginx_data/static
+    git config --global --add safe.directory /home/labca/nginx_data/static
     git status --short &> /dev/null || rc=$?
     if [ $rc -gt 0 ]; then
-        git init >>$installLog
+        git init &>>$installLog
     fi
     git add --all &>/dev/null || true
     git commit --all --quiet -m "LabCA before update $runId" &>>$installLog && { msg_ok "Commit existing modifications of $adminDir"; msg_info "$msg"; } || true
 
     mkdir -p .well-known/acme-challenge
+    find .well-known/acme-challenge/ -type f -mtime +10 -exec rm {} \;  # Clean up files older than 10 days
     mkdir -p crl
-    cp -rp $cloneDir/www/* .
-    sed -i -e "s|\[LABCA_CPS_LOCATION\]|http://$LABCA_FQDN/cps/|g" cps/index.html
-    sed -i -e "s|\[LABCA_CERTS_LOCATION\]|http://$LABCA_FQDN/certs/|g" cps/index.html
+    [ -e cert ] || ln -s certs cert
+    cp -rp $cloneDir/gui/static/* .
+    [ -e $adminDir/data/root-ca.pem ] && cp $adminDir/data/root-ca.pem certs/ || true
+    [ -e $adminDir/data/issuer/ca-int.pem ] && cp $adminDir/data/issuer/ca-int.pem certs/ || true
 
     local have_config=$(grep restarted $adminDir/data/config.json | grep true)
     if [ "$have_config" != "" ]; then
-        export PKI_ROOT_CERT_BASE="$adminDir/data/root-ca"
-        export PKI_INT_CERT_BASE="$adminDir/data/issuer/ca-int"
-        export PKI_DEFAULT_O=$(grep organization $adminDir/data/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
-
         $adminDir/apply-nginx
-    else
-        chown -R www-data:www-data .
     fi
 
     git add --all &>/dev/null || true
@@ -408,19 +533,16 @@ static_web() {
 
 # Create a temporary self-signed certificate if there is no certificate yet
 selfsigned_cert() {
-    if [ -e /etc/nginx/ssl/labca_cert.pem ]; then
+    if [ -e /home/labca/nginx_data/ssl/labca_cert.pem ]; then
         msg_ok "Certificate is present"
     else
         local msg="Create self-signed certificate"
         msg_info "$msg"
-        mkdir -p /etc/nginx/ssl
-        cd /etc/nginx/ssl
+        mkdir -p /home/labca/nginx_data/ssl
+        cd /home/labca/nginx_data/ssl
         openssl req -x509 -nodes -sha256 -newkey rsa:2048 -keyout labca_key.pem -out labca_cert.pem -days 7 \
             -subj "/O=LabCA/CN=$LABCA_FQDN" -reqexts SAN -extensions SAN \
             -config <(cat /etc/ssl/openssl.cnf <(printf "\n[SAN]\nbasicConstraints=CA:FALSE\nnsCertType=server\nsubjectAltName=DNS:$LABCA_FQDN")) &>>$installLog
-        chown -R www-data:www-data labca_*
-
-        service nginx restart &>>$installLog
         msg_ok "$msg"
     fi
 }
@@ -428,24 +550,29 @@ selfsigned_cert() {
 # Clone or update the boulder code (Let's Encrypt (tm) implementation of ACME protocol)
 get_boulder() {
     export GOPATH="/home/labca/gopath"
-    sudo -u labca mkdir -p "$GOPATH/src/github.com/letsencrypt"
-    [ -h "$boulderDir" ] || sudo -u labca ln -s "$GOPATH/src/github.com/letsencrypt/boulder" "$boulderDir"
+    sudo -u labca -H mkdir -p "$GOPATH/src/github.com/letsencrypt"
+    [ -h "$boulderDir" ] || sudo -u labca -H ln -s "$GOPATH/src/github.com/letsencrypt/boulder" "$boulderDir"
 
     if [ -e "$boulderDir" ]; then
         cd "$boulderDir"
-        git checkout -- docker-compose.yml errors/errors.go policy/pa.go
-        git reset --hard &>>$installLog
+        chown -R labca:labca .
+        rm -rf bin/orphan-finder bin/validate
+        mkdir -p $baseDir/backup
+        [ ! -d .softhsm-tokens ] || mv .softhsm-tokens $baseDir/backup/ &>>$installLog
+        sudo -u labca -H git reset --hard HEAD^1 &>>$installLog
     fi
 
     clone_or_pull "$GOPATH/src/github.com/letsencrypt/boulder" "$boulderUrl"
 
     cd "$boulderDir"
-    sudo -u labca git reset --hard $boulderTag &>>$installLog
+    chown -R labca:labca .
+    sudo -u labca -H git reset --hard $boulderTag &>>$installLog
+    sudo -u labca -H git prune &>>$installLog
     if [ -e "sa/_db-next/migrations/20190221140139_AddAuthz2.sql" ]; then
-        sudo -u labca cp sa/_db-next/migrations/20190221140139_AddAuthz2.sql sa/_db/migrations/
+        sudo -u labca -H cp sa/_db-next/migrations/20190221140139_AddAuthz2.sql sa/_db/migrations/
     fi
     if [ -e "sa/_db-next/migrations/20190524120239_AddAuthz2ExpiresIndex.sql" ]; then
-        sudo -u labca cp sa/_db-next/migrations/20190524120239_AddAuthz2ExpiresIndex.sql sa/_db/migrations/
+        sudo -u labca -H cp sa/_db-next/migrations/20190524120239_AddAuthz2ExpiresIndex.sql sa/_db/migrations/
     fi
     msg_ok "Boulder checkout '$boulderTag'"
 }
@@ -458,143 +585,111 @@ config_boulder() {
     [ -d "$boulderLabCADir" ] || mkdir -p "$boulderLabCADir"
     cd "$boulderLabCADir"
     local rc=0
+    git config --global --add safe.directory "$boulderLabCADir"
     git status --short &> /dev/null || rc=$?
     if [ $rc -gt 0 ]; then
-        git init >>$installLog
+        git init &>>$installLog
     fi
     [ -d ".backup" ] || mkdir -p ".backup"
 
     git add --all &>/dev/null || true
-    git commit --all --quiet -m "LabCA before update $runId" &>>$installLog && { msg_ok "Commit existing modifications of $boulderLabCADir"; msg_info "$msg"; } || true
+    [ "$installMode" == "normal" ] && git commit --all --quiet -m "LabCA before update $runId" &>>$installLog && { msg_ok "Commit existing modifications of $boulderLabCADir"; msg_info "$msg"; } || true
 
     [ ! -e "$boulderLabCADir/secrets/smtp_password" ] || mv "$boulderLabCADir/secrets/smtp_password" "$boulderLabCADir/secrets/smtp_password_PRESERVE"
     cp -r "$boulderDir/test" -T "$boulderLabCADir" &>>$installLog
     [ ! -e "$boulderLabCADir/secrets/smtp_password_PRESERVE" ] || mv "$boulderLabCADir/secrets/smtp_password_PRESERVE" "$boulderLabCADir/secrets/smtp_password"
-    chown -R labca:labca "$boulderLabCADir"
+    [ "$installMode" == "normal" ] && chown -R labca:labca "$boulderLabCADir" || /bin/true
+
+    rm -rf authz-filler challtestsrv gsb-test-srv
 
     msg_ok "$msg"
     msg="Configure the boulder application"
     msg_info "$msg"
 
     cd "$boulderDir"
-    sudo -u labca patch -p1 < $cloneDir/docker-compose.patch &>>$installLog
+    if [ "$installMode" == "normal" ]; then
+        $cloneDir/patch.sh "sudo -u labca -H" &>>$installLog
+        sed -i -e "s/LABCA_FQDN: .*/LABCA_FQDN: $LABCA_FQDN/" docker-compose.yml
+    else
+        $cloneDir/patch.sh &>>$installLog
+    fi
+
+    git config --global --add safe.directory /home/labca/boulder_labca
+
     cp docker-compose.yml "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/core_interfaces.patch &>>$installLog
+    cp cmd/shell.go "$boulderLabCADir/.backup/"
     cp core/interfaces.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/policy_pa.patch &>>$installLog
     cp policy/pa.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/ra_ra.patch &>>$installLog
     cp ra/ra.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/mail_mailer.patch &>>$installLog
     cp mail/mailer.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/expiration-mailer_main.patch &>>$installLog
     cp cmd/expiration-mailer/main.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/notify-mailer_main.patch &>>$installLog
     cp cmd/notify-mailer/main.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 < $cloneDir/bad-key-revoker_main.patch &>>$installLog
+    cp cmd/contact-auditor/main.go "$boulderLabCADir/.backup/"
     cp cmd/bad-key-revoker/main.go "$boulderLabCADir/.backup/"
-
-    sudo -u labca patch -p1 -o "$boulderLabCADir/entrypoint.sh" < $cloneDir/entrypoint.patch &>>$installLog
-    sudo -u labca patch -p1 -o "$boulderLabCADir/startservers.py" < $cloneDir/startservers.patch &>>$installLog
-    sudo -u labca patch -p1 < $cloneDir/startservers.patch &>>$installLog
-
-    sudo -u labca patch -p1 -o "$boulderLabCADir/config/ca-a.json" < $cloneDir/test_config_ca_a.patch &>>$installLog
-    sudo -u labca patch -p1 -o "$boulderLabCADir/config/ca-b.json" < $cloneDir/test_config_ca_b.patch &>>$installLog
-
-    sudo -u labca patch -p1 -o "$boulderLabCADir/config/expiration-mailer.json" < $cloneDir/config_expiration-mailer.patch &>>$installLog
-    sudo -u labca patch -p1 -o "$boulderLabCADir/config/notify-mailer.json" < $cloneDir/config_notify-mailer.patch &>>$installLog
-    sudo -u labca patch -p1 -o "$boulderLabCADir/config/bad-key-revoker.json" < $cloneDir/config_bad-key-revoker.patch &>>$installLog
-
-    sed -i -e "s|https://letsencrypt.org/docs/rate-limits/|http://$LABCA_FQDN/rate-limits|" errors/errors.go &>>$installLog
+    cp cmd/cert-checker/main.go "$boulderLabCADir/.backup/"
+    cp cmd/log-validator/main.go "$boulderLabCADir/.backup/"
+    cp cmd/boulder/main.go "$boulderLabCADir/.backup/"
+    cp ratelimit/rate-limits.go "$boulderLabCADir/.backup/"
     cp errors/errors.go "$boulderLabCADir/.backup/"
-
-    sed -i -e "s/\"150405/\"060102150405/" log/log.go &>>$installLog
     cp log/log.go "$boulderLabCADir/.backup/"
+    cp sa/db/boulder_sa/20230419000000_CombinedSchema.sql "$boulderLabCADir/.backup/"
+    cp Makefile "$boulderLabCADir/.backup/"
 
-    mkdir -p "cmd/mail-tester"
-    cp $cloneDir/mail-tester.go cmd/mail-tester/main.go
+    if [ "$installMode" == "normal" ]; then
+        $cloneDir/patch-cfg.sh "sudo -u labca -H" "$boulderLabCADir" &>>$installLog
+    else
+        $cloneDir/patch-cfg.sh " " "$boulderLabCADir" &>>$installLog
+    fi
 
-    cd "$boulderLabCADir"
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/ocsp-responder.json
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/ocsp-updater.json
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/publisher.json
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/ra.json
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/wfe.json
-    sed -i -e "s/test-ca2.pem/test-ca.pem/" config/wfe2.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/akamai-purger.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/ocsp-responder.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/ocsp-updater.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/publisher.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/ra.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/wfe.json
-    sed -i -e "s|/tmp/intermediate-cert-rsa-a.pem|labca/test-ca.pem|" config/wfe2.json
-    sed -i -e "s/5001/443/g" config/va.json
-    sed -i -e "s/5002/80/g" config/va.json
-    sed -i -e "s/5001/443/g" config/va-remote-a.json
-    sed -i -e "s/5002/80/g" config/va-remote-a.json
-    sed -i -e "s/5001/443/g" config/va-remote-b.json
-    sed -i -e "s/5002/80/g" config/va-remote-b.json
-    sed -i -e "s|http://boulder:4000/terms/v1|http://$LABCA_FQDN/terms/v1|" config/wfe.json
-    sed -i -e "s|https://boulder:4431/terms/v7|https://$LABCA_FQDN/terms/v1|" config/wfe2.json
-    sed -i -e "s|http://boulder:4430/acme/issuer-cert|http://$LABCA_FQDN/acme/issuer-cert|" config/ca-a.json
-    sed -i -e "s|http://boulder:4430/acme/issuer-cert|http://$LABCA_FQDN/acme/issuer-cert|" config/ca-b.json
-    sed -i -e "s|http://127.0.0.1:4000/acme/issuer-cert|http://$LABCA_FQDN/acme/issuer-cert|" config/ca-a.json
-    sed -i -e "s|http://127.0.0.1:4000/acme/issuer-cert|http://$LABCA_FQDN/acme/issuer-cert|" config/ca-b.json
-    sed -i -e "s|http://boulder:4430/acme/issuer-cert|http://$LABCA_FQDN/acme/issuer-cert|" config/wfe2.json
-    sed -i -e "s|http://127.0.0.1:4000/acme/issuer-cert|https://$LABCA_FQDN/acme/issuer-cert|" config/wfe2.json
-    sed -i -e "s|http://127.0.0.1:4002/|http://$LABCA_FQDN/ocsp/|g" config/ca-a.json
-    sed -i -e "s|http://127.0.0.1:4002/|http://$LABCA_FQDN/ocsp/|g" config/ca-b.json
-    sed -i -e "s|http://example.com/cps|http://$LABCA_FQDN/cps/|g" config/ca-a.json
-    sed -i -e "s|http://example.com/cps|http://$LABCA_FQDN/cps/|g" config/ca-b.json
-    sed -i -e "s|1.2.3.4|1.3.6.1.4.1.44947.1.1.1|g" config/ca-a.json
-    sed -i -e "s|1.2.3.4|1.3.6.1.4.1.44947.1.1.1|g" config/ca-b.json
-    sed -i -e 's|            "crl_url": "http://example.com/crl",||g' config/ca-a.json
-    sed -i -e 's|            "crl_url": "http://example.com/crl",||g' config/ca-b.json
-    sed -i -e "s/Do What Thou Wilt/This PKI is only meant for internal (lab) usage; do NOT use this on the open internet\!/g" config/ca-a.json
-    sed -i -e "s/Do What Thou Wilt/This PKI is only meant for internal (lab) usage; do NOT use this on the open internet\!/g" config/ca-b.json
-    sed -i -e "s/ocspURL.Path = encodedReq/ocspURL.Path += encodedReq/" ocsp/helper/helper.go
-    sed -i -e "s/\"dnsTimeout\": \".*\"/\"dnsTimeout\": \"3s\"/" config/ra.json
-    sed -i -e "s/\"dnsTimeout\": \".*\"/\"dnsTimeout\": \"3s\"/" config/va.json
-    sed -i -e "s/\"dnsTimeout\": \".*\"/\"dnsTimeout\": \"3s\"/" config/va-remote-a.json
-    sed -i -e "s/\"dnsTimeout\": \".*\"/\"dnsTimeout\": \"3s\"/" config/va-remote-b.json
-
-    for file in `find . -type f | grep -v .git`; do
-        sed -i -e "s|test/|labca/|g" $file
+    mkdir -p $baseDir/backup
+    if [ ! -z "$(docker ps | grep boulder-bmysql-1)" ]; then
+        docker exec boulder-bmysql-1 mysqldump --databases boulder_sa_integration >$baseDir/backup/dbdata-old-${runId}.sql
+        docker exec boulder-bmysql-1 mysql boulder_sa_integration -e 'delete from gorp_migrations;'
+        msg_ok "Saved pre-update database to dbdata-old-${runId}.sql"
+        msg_info "$msg"
+    fi
+    if [ ! -z "$(docker ps | grep labca-bmysql-1)" ]; then
+        docker exec labca-bmysql-1 mysqldump --databases boulder_sa_integration >$baseDir/backup/dbdata-${runId}.sql
+        docker exec labca-bmysql-1 mysql boulder_sa_integration -e 'delete from gorp_migrations;'
+        msg_ok "Saved pre-update database to dbdata-${runId}.sql"
+        msg_info "$msg"
+    fi
+    # housekeeping
+    for file in `ls -1t $baseDir/backup/dbdata-*.sql 2>&1 | tail -n +3 || true`; do
+        rm $file
     done
 
-    sed -i -e "s/names/name\(s\)/" example-expiration-template
+    if [ "$installMode" == "normal" ]; then
+        cd "$boulderLabCADir"
+        sed -i -e "s|https://boulder.service.consul:4431/terms/v7|https://$LABCA_FQDN/terms/v1|" config/wfe2.json
+        sed -i -e "s|boulder.service.consul:4000|$LABCA_FQDN|g" config/wfe2.json
+        sed -i -e "s|http://ca.example.org:4002/|http://$LABCA_FQDN/ocsp/|g" config/ca.json
+        sed -i -e "s|http://ca.example.org:4501/rsa-a/|http://$LABCA_FQDN/crl/|g" config/ca.json
+        sed -i -e "s|boulder.service.consul:4000|$LABCA_FQDN|g" config/remoteva-a.json
+        sed -i -e "s|boulder.service.consul:4001|$LABCA_FQDN|g" config/remoteva-a.json
+        sed -i -e "s|boulder.service.consul:4000|$LABCA_FQDN|g" config/remoteva-b.json
+        sed -i -e "s|boulder.service.consul:4001|$LABCA_FQDN|g" config/remoteva-b.json
+        sed -i -e "s|boulder.service.consul:4000|$LABCA_FQDN|g" config/va.json
+        sed -i -e "s|boulder.service.consul:4001|$LABCA_FQDN|g" config/va.json
+        cd "$boulderDir"
+    fi
 
-    rm test-ca2.pem
+    ([ -e mock-vendor.go ] && rm mock-vendor.go) || /bin/true
+    ([ -e test-tools.go ] && rm test-tools.go) || /bin/true
 
-    local have_config=$(grep restarted $adminDir/data/config.json | grep true)
-    if [ "$have_config" != "" ]; then
-        export PKI_ROOT_CERT_BASE="$adminDir/data/root-ca"
-        export PKI_INT_CERT_BASE="$adminDir/data/issuer/ca-int"
-        export PKI_DNS=$(grep dns $adminDir/data/config.json | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_DOMAIN=$(grep fqdn $adminDir/data/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g' | perl -p0e 's/.*?\.//')
-        export PKI_DOMAIN_MODE=$(grep domain_mode $adminDir/data/config.json | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_LOCKDOWN_DOMAINS=$(grep lockdown $adminDir/data/config.json | grep -v domain_mode | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_WHITELIST_DOMAINS=$(grep whitelist $adminDir/data/config.json | grep -v domain_mode | sed -e 's/.*:[ ]*//' | sed -e 's/\",//g' | sed -e 's/\"//g')
-
-        export PKI_EMAIL_SERVER=$(grep server $adminDir/data/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_EMAIL_PORT=$(grep port $adminDir/data/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_EMAIL_USER=$(grep user $adminDir/data/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
-        export PKI_EMAIL_FROM=$(grep from $adminDir/data/config.json | head -1 | perl -p0e 's/.*?:\s+(.*)/\1/' | sed -e 's/\",//g' | sed -e 's/\"//g')
-
-        $adminDir/apply-boulder &>>$installLog
-    else
-        chown -R labca:labca "$boulderLabCADir"
+    if [ "$installMode" == "normal" ]; then
+        local have_config=$(grep restarted $adminDir/data/config.json 2>/dev/null | grep true)
+        if [ "$have_config" != "" ]; then
+            cd "$boulderLabCADir"
+            $adminDir/apply-boulder &>>$installLog
+            cd "$boulderDir"
+        else
+            chown -R labca:labca "$boulderLabCADir" || /bin/true
+        fi
     fi
 
     git add --all &>/dev/null || true
-    git commit --all --quiet -m "LabCA after update $runId" &>>$installLog || true
+    [ "$installMode" == "normal" ] && git commit --all --quiet -m "LabCA after update $runId" &>>$installLog || true
 
     msg_ok "$msg"
 }
@@ -604,13 +699,15 @@ cleanup() {
     local msg="Cleaning up obsolete files"
     msg_info "$msg"
 
-    rm -f /var/www/html/css/skeleton.css
-    rm -f /var/www/html/css/skeleton-tabs.css
-    rm -f /var/www/html/css/normalize.css
-    rm -f /var/www/html/css/font.css
-    rm -f /var/www/html/img/favicon.ico
-    rm -f /var/www/html/js/jquery-3.3.1.min.js
-    rm -f /var/www/html/js/skeleton-tabs.js
+    if [ -d /var/www/html ]; then
+        rm -f /var/www/html/css/skeleton.css
+        rm -f /var/www/html/css/skeleton-tabs.css
+        rm -f /var/www/html/css/normalize.css
+        rm -f /var/www/html/css/font.css
+        rm -f /var/www/html/img/favicon.ico
+        rm -f /var/www/html/js/jquery-3.3.1.min.js
+        rm -f /var/www/html/js/skeleton-tabs.js
+    fi
     rm -f $adminDir/templates/cert.tmpl
     rm -f $adminDir/templates/error.tmpl
     rm -f $adminDir/templates/final.tmpl
@@ -623,6 +720,11 @@ cleanup() {
     rm -f $adminDir/templates/setup.tmpl
     rm -f $adminDir/templates/wrapup.tmpl
 
+    # Remove host nginx if installed, as we are now using the docker container
+    systemctl stop nginx &>>$installLog || true
+    systemctl disable nginx &>>$installLog || true
+    apt remove -y nginx &>>$installLog
+
     msg_ok "$msg"
 }
 
@@ -631,38 +733,84 @@ startup() {
     local msg="Restart docker containers and service"
 
     cd "$boulderDir"
-    cnt=$(docker-compose ps | wc -l)
-    if [ "$cnt" == "2" ]; then
+    cnt=$(docker compose ps | wc -l)
+    if [ "$cnt" -le "2" ]; then
         msg="Download docker images and build containers"
     fi
     msg_info "$msg (this will take a while!!)"
 
-    docker-compose stop &>>$installLog || true
-    docker stop boulder_bhsm_1 &>>$installLog | /bin/true
-    wait_down $PS_MYSQL &>>$installLog
-    wait_down $PS_LABCA &>>$installLog
-    wait_down $PS_BOULDER &>>$installLog
-    docker rm -f boulder_bhsm_1 &>>$installLog | /bin/true
-    docker-compose up -d &>>$installLog
+    export BOULDER_TOOLS_TAG=$(grep go1. .github/workflows/boulder-ci.yml | head -1 | sed -e "s/\s*- //")
+    docker compose pull -q &>>$installLog
+    docker pull -q letsencrypt/boulder-tools:$BOULDER_TOOLS_TAG &>>$installLog
 
-    [ -h "/etc/init.d/labca" ] || ln -s "$cloneDir/init_d" /etc/init.d/labca
-    update-rc.d labca defaults &>>$installLog
-    update-rc.d labca enable &>>$installLog
-    service labca stop &>>$installLog || true
-    wait_down $PS_SERVICE &>>$installLog
-    service labca start &>>$installLog
-    wait_up $PS_SERVICE &>>$installLog
+    # Cleanup any remaining containers with old names
+    docker compose -p boulder stop &>>$installLog || true
+    docker compose -p boulder rm -f &>>$installLog || true
+    for ct in boulder_bhsm_1 boulder_bredis_1 boulder_bredis_2 boulder_bredis_3 boulder_bredis_4 boulder_bredis_5 boulder_bredis_6; do
+        [ -z "$(docker ps | grep $ct)" ] || docker stop $ct &>>$installLog
+    done
+    for ct in boulder_bhsm_1 boulder_bredis_1 boulder_bredis_2 boulder_bredis_3 boulder_bredis_4 boulder_bredis_5 boulder_bredis_6; do
+        [ -z "$(docker ps -a | grep -e "$ct\$")" ] || docker rm -f $ct &>>$installLog
+    done
+    docker network rm -f boulder_bluenet boulder_consulnet boulder_rednet &>>$installLog || true
+    docker stop boulder-labca-1 >&/dev/null || true
+    docker rm -f boulder-labca-1 >&/dev/null || true
+    docker stop labca-labca-1 >&/dev/null || true
+    docker rm -f labca-labca-1 >&/dev/null || true
 
-    wait_up $PS_MYSQL &>>$installLog
-    wait_up $PS_LABCA &>>$installLog
-    wait_up $PS_BOULDER $PS_BOULDER_COUNT &>>$installLog
+    cnt=$(count $PS_CONTROL || echo "0")
+    haserr=$(docker compose logs | grep "cannot assign requested address" | wc -l)
+    docker compose stop &>>$installLog || true
+    wait_down $PS_NGINX &>>$installLog || true
+    wait_down $PS_MYSQL &>>$installLog || true
+    wait_down $PS_CONSUL &>>$installLog || true
+    wait_down $PS_PKILINT &>>$installLog || true
+    wait_down $PS_LABCA &>>$installLog || true
+    wait_down $PS_CONTROL &>>$installLog || true
+    wait_down $PS_BOULDER &>>$installLog || true
+
+    if [ $dcdowngraded -eq 1 ] || [ $haserr -ne 0 ]; then
+        docker compose rm -f &>>$installLog || true
+    fi
+
+    local rc=0
+    service labca status &> /dev/null || rc=$?
+    if [ $rc -eq 0 ]; then
+        service labca stop &>>$installLog || true
+        update-rc.d labca disable &>>$installLog || true
+        [ -e "/etc/init.d/labca" ] && rm /etc/init.d/labca || true
+    fi
+
+    [ -d /home/labca/control_logs ] || mkdir -p /home/labca/control_logs
+
+    docker network rm -f labca_bluenet labca_rednet &>>$installLog || true
+
+    # Restore MySQL data when moving from boulder-bmysql-1 to labca-bmysql-1
+    if [ -z "$(docker volume ls | grep labca_dbdata)" ] && [ ! -z "$(docker volume ls | grep boulder_dbdata)" ]; then
+        docker volume create labca_dbdata &>>$installLog
+        dimg=$(grep mariadb: docker-compose.yml | sed -e "s/\s*image:\s*//")
+        docker run --rm -v boulder_dbdata:/old -v labca_dbdata:/new $dimg bash -c "cp -R /old/* /new/" &>>$installLog
+    fi
+
+    [ ! -d $baseDir/backup/.softhsm-tokens ] || mkdir -p $boulderLabCADir/certs/; mv $baseDir/backup/.softhsm-tokens $boulderLabCADir/certs/ &>>$installLog
+
+    COMPOSE_HTTP_TIMEOUT=180 docker compose up -d &>>$installLog
+
+    wait_up $PS_NGINX &>>$installLog || true
+    wait_up $PS_MYSQL &>>$installLog || true
+    wait_up $PS_CONSUL 2 &>>$installLog || true
+    wait_up $PS_PKILINT &>>$installLog || true
+    wait_up $PS_LABCA &>>$installLog || true
+    wait_up $PS_CONTROL &>>$installLog || true
+    docker exec -i labca-bmysql-1 mysql_upgrade &>>$installLog
+    [ -f "$boulderLabCADir/setup_complete" ] && wait_up $PS_BOULDER $PS_BOULDER_COUNT &>>$installLog || true
 
     msg_ok "$msg"
 }
 
 # If the nginx certificate is self-signed then show extra text
 first_time() {
-    local certFile="/etc/nginx/ssl/labca_cert.pem"
+    local certFile="/home/labca/nginx_data/ssl/labca_cert.pem"
     [ -e "$certFile" ] || msg_fatal "The SSL certificate $certFile does not exist"
 
     local subject=$(openssl x509 -noout -in "$certFile" -subject_hash)
@@ -679,6 +827,20 @@ first_time() {
     fi
 }
 
+check_dockeronly() {
+    set +e
+    wd=$(which docker)
+    set -e
+    if [ "$wd" != "" ]; then
+        let num=$(docker volume ls | grep labca_ | grep -v labca_dbdata | wc -l)
+        if [ $num -gt 0 ]; then
+            scriptname=$(basename $0)
+            echo "You can not run the $scriptname script when using dockeronly mode!"
+            exit 1
+        fi
+    fi
+}
+
 #
 # The actual main function to tie it all together
 #
@@ -686,20 +848,49 @@ main() {
     local curdir="$PWD"
 
     echo
+    check_dockeronly
+
     start_temporary_log
     check_root
     install_pkg "git"
+    install_pkg "sudo"
+    install_pkg "patch"
     labca_user
     end_temporary_log
 
     this=$0
     [ -e $this ] || this="$curdir/$0"
-    local checksum=$(md5sum $this 2>/dev/null | cut -d' ' -f1)
+    curChecksum=$(md5sum $this 2>/dev/null | cut -d' ' -f1)
     [ ! -e "$cloneDir/cron_d" ] || chown labca:labca "$cloneDir/cron_d"
 
+    # Stop any running containers to prevent data migration issues...
+    if [ -d "$boulderDir" ]; then
+        cd "$boulderDir"
+        docker compose stop &>/dev/null || true
+    fi
+
     parse_cmdline "$@"
-    clone_or_pull "$cloneDir" "$labcaUrl" "$cmdlineBranch"
-    restart_if_updated "$checksum"
+    if [ $keepLocal -eq 0 ]; then
+        clone_or_pull "$cloneDir" "$labcaUrl" "$cmdlineBranch"
+        checkout_release "$cmdlineBranch"
+        restart_if_updated
+    fi
+
+    if [ $alphaTest -eq 1 ]; then
+        install_extra
+        cd $(dirname $this)
+        local msg="TEST: build labca-gui binary"
+        msg_info "$msg"
+        # this will ultimately NOT be done on the target machine!
+        build/build.sh &>>$installLog || msg_fatal "Could not build docker images!"
+        msg_ok "$msg"
+        msg="TEST build local docker image"
+        msg_info "$msg"
+        build/tag_and_upload.sh &>>$installLog || msg_fatal "Could not tag (and upload) docker images!"
+        msg_ok "$msg"
+        msg_ok "That's it for now!"
+        exit 0
+    fi
 
     get_fqdn
     copy_admin
@@ -724,4 +915,4 @@ main() {
     cd "$curdir"
 }
 
-main "$@"
+[ "$installMode" == "normal" ] && main "$@" || /bin/true

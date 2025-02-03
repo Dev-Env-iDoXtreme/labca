@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -e
+
+RENEW=30
+TODAY=`date '+%Y_%m_%d'`
+
+echo "Running cron-$(basename $0) for ${TODAY}..."
+
+if ! expires=`openssl x509 -checkend $[ 86400 * $RENEW ] -noout -in /etc/nginx/ssl/labca_cert.pem`; then
+    echo "    renewing!"
+    cp -p /etc/nginx/ssl/labca_cert.pem /etc/nginx/ssl/labca_cert_$TODAY.pem
+    /opt/labca/renew
+fi
+
+cd /opt/labca/gui
+/opt/labca/bin/labca-gui -config /opt/labca/data/config.json -renewcrl $RENEW

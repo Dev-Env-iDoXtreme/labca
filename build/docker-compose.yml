@@ -1,0 +1,221 @@
+name: labca
+services:
+  boulder:
+    # The `letsencrypt/boulder-tools:latest` tag is automatically built in local
+    # dev environments. In CI a specific BOULDER_TOOLS_TAG is passed, and it is
+    # pulled with `docker compose pull`.
+    image: ghcr.io/hakwerk/labca-boulder:${LABCA_IMAGE_VERSION:-latest}
+    build:
+      context: test/boulder-tools/
+      # Should match one of the GO_CI_VERSIONS in test/boulder-tools/tag_and_upload.sh.
+      args:
+        GO_VERSION: 1.23.1
+    environment:
+      # To solve HTTP-01 and TLS-ALPN-01 challenges, change the IP in FAKE_DNS
+      # to the IP address where your ACME client's solver is listening.
+      # FAKE_DNS: 172.17.0.1
+      FAKE_DNS: 10.77.77.77
+      BOULDER_CONFIG_DIR: labca/config
+      GOCACHE: /boulder/.gocache/go-build
+      GOFLAGS: -mod=vendor
+    volumes:
+      - boulder_data:/opt/boulder/labca
+      - certificates:/opt/boulder/labca/certs
+      - nginx_html:/var/www/html
+      - softhsm:/var/lib/softhsm/tokens
+    networks:
+      bouldernet:
+        ipv4_address: 10.77.77.77
+      integrationtestnet:
+        ipv4_address: 10.88.88.88
+      consulnet:
+        ipv4_address: 10.55.55.55
+    # Use consul as a backup to Docker's embedded DNS server. If there's a name
+    # Docker's DNS server doesn't know about, it will forward the query to this
+    # IP (running consul).
+    # (https://docs.docker.com/config/containers/container-networking/#dns-services).
+    # This is used to look up service names via A records (like ra.service.consul) that
+    # are configured via the ServerAddress field of cmd.GRPCClientConfig.
+    # TODO: Remove this when ServerAddress is deprecated in favor of SRV records
+    # and DNSAuthority.
+    dns: 10.55.55.10
+    extra_hosts:
+      # Allow the boulder container to be reached as "ca.example.org", so that
+      # we can put that name inside our integration test certs (e.g. as a crl
+      # url) and have it look like a publicly-accessible name.
+      - "ca.example.org:10.77.77.77"
+    ports:
+      - 4001:4001 # ACMEv2
+      - 4002:4002 # OCSP
+      - 4003:4003 # SFE
+    depends_on:
+      - bmysql
+      - bconsul
+      - bpkilint
+      - control
+    entrypoint: labca/entrypoint.sh
+    working_dir: &boulder_working_dir /opt/boulder
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "5"
+    restart: always
+
+  bmysql:
+    image: mariadb:10.5
+    volumes:
+      - dbdata:/var/lib/mysql
+    networks:
+      bouldernet:
+        aliases:
+          - boulder-mysql
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    # Send slow queries to a table so we can check for them in the
+    # integration tests. For now we ignore queries not using indexes,
+    # because that seems to trigger based on the optimizer's choice to not
+    # use an index for certain queries, particularly when tables are still
+    # small.
+    command: mysqld --bind-address=0.0.0.0 --slow-query-log --log-output=TABLE --log-queries-not-using-indexes=ON
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "5"
+    restart: always
+
+  bconsul:
+    image: hashicorp/consul:1.15.4
+    depends_on:
+      - control
+    volumes:
+      - boulder_data:/opt/boulder/labca
+      - certificates:/opt/boulder/labca/certs
+    networks:
+      consulnet:
+        ipv4_address: 10.55.55.10
+      bouldernet:
+        ipv4_address: 10.77.77.10
+    command: "consul agent -dev -config-format=hcl -config-file=/opt/boulder/labca/consul/config.hcl"
+    working_dir: /opt/boulder
+    restart: always
+
+  gui:
+    image: ghcr.io/hakwerk/labca-gui:${LABCA_IMAGE_VERSION:-latest}
+    networks:
+      - bouldernet
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose.yml:/opt/boulder/docker-compose.yml
+      - ldata:/opt/labca/data
+      - nginx_html:/var/www/html
+      - backup:/opt/backup
+      - boulder_data:/opt/boulder/labca
+      - certificates:/opt/boulder/labca/certs
+      - softhsm:/var/lib/softhsm/tokens
+    expose:
+      - 3000
+    depends_on:
+      - bmysql
+      - control
+    working_dir: /opt/labca
+    command: bin/labca-gui
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "5"
+    restart: always
+
+  nginx:
+    image: nginx:1.27.3
+    restart: always
+    networks:
+      - bouldernet
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - nginx_conf:/etc/nginx/conf.d
+      - nginx_ssl:/etc/nginx/ssl
+      - nginx_html:/var/www/html
+    depends_on:
+      - control
+
+  control:
+    image: ghcr.io/hakwerk/labca-control:${LABCA_IMAGE_VERSION:-latest}
+    networks:
+      - bouldernet
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose.yml:/opt/boulder/docker-compose.yml
+      - ldata:/opt/labca/data
+      - backup:/opt/backup
+      - logs:/opt/logs
+      - boulder_data:/opt/boulder/labca
+      - certificates:/opt/boulder/labca/certs
+      - softhsm:/var/lib/softhsm/tokens
+      - nginx_conf:/etc/nginx/conf.d
+      - nginx_ssl:/etc/nginx/ssl
+      - nginx_html:/var/www/html
+    expose:
+      - 3030
+    environment:
+      LABCA_FQDN: ${LABCA_FQDN:-notset}
+    working_dir: /opt/labca
+    command: ./control.sh
+    restart: always
+
+  bpkilint:
+    image: ghcr.io/digicert/pkilint:v0.10.1
+    networks:
+      bouldernet:
+        ipv4_address: 10.77.77.9
+    command: "gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:80 pkilint.rest:app"
+
+volumes:
+  dbdata:
+  nginx_conf:
+  nginx_ssl:
+  nginx_html:
+  boulder_data:
+  ldata:
+  backup:
+  logs:
+  softhsm:
+  certificates:
+
+networks:
+  # This network is primarily used for boulder services. It is also used by
+  # challtestsrv, which is used in the integration tests.
+  bouldernet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.77.77.0/24
+
+  # This network is used for two things in the integration tests:
+  #  - challtestsrv binds to 10.88.88.88:443 for its tls-alpn-01 challenge
+  #    responder, to avoid interfering with the HTTPS port used for testing
+  #    HTTP->HTTPS redirects during http-01 challenges. Note: this could
+  #    probably be updated in the future so that challtestsrv can handle
+  #    both tls-alpn-01 and HTTPS on the same port.
+  #  - test/v2_integration.py has some test cases that start their own HTTP
+  #    server instead of relying on challtestsrv, because they want very
+  #    specific behavior. For these cases, v2_integration.py creates a Python
+  #    HTTP server and binds it to 10.88.88.88:80.
+  integrationtestnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.88.88.0/24
+
+  consulnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.55.55.0/24

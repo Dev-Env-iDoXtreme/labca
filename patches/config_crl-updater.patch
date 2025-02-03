@@ -1,0 +1,31 @@
+diff --git a/test/config/crl-updater.json b/test/config/crl-updater.json
+index 21f3603bb..77450c65f 100644
+--- a/test/config/crl-updater.json
++++ b/test/config/crl-updater.json
+@@ -36,19 +36,14 @@
+ 			"hostOverride": "crl-storer.boulder"
+ 		},
+ 		"issuerCerts": [
+-			"test/certs/webpki/int-rsa-a.cert.pem",
+-			"test/certs/webpki/int-rsa-b.cert.pem",
+-			"test/certs/webpki/int-rsa-c.cert.pem",
+-			"test/certs/webpki/int-ecdsa-a.cert.pem",
+-			"test/certs/webpki/int-ecdsa-b.cert.pem",
+-			"test/certs/webpki/int-ecdsa-c.cert.pem"
++			"test/certs/webpki/int-rsa-a.cert.pem"
+ 		],
+-		"numShards": 10,
+-		"shardWidth": "240h",
+-		"lookbackPeriod": "24h",
+-		"updatePeriod": "6h",
+-		"updateOffset": "9120s",
+-		"maxParallelism": 10,
++		"numShards": 1,
++		"shardWidth": "24h",
++		"lookbackPeriod": "96h",
++		"updatePeriod": "24h",
++		"updateOffset": "5m",
++		"maxParallelism": 1,
+ 		"maxAttempts": 5,
+ 		"features": {}
+ 	},

@@ -1,0 +1,20 @@
+diff --git a/test/config/crl-storer.json b/test/config/crl-storer.json
+index 3ab267b0f..3c6f5c6a2 100644
+--- a/test/config/crl-storer.json
++++ b/test/config/crl-storer.json
+@@ -23,13 +23,9 @@
+ 			}
+ 		},
+ 		"issuerCerts": [
+-			"test/certs/webpki/int-rsa-a.cert.pem",
+-			"test/certs/webpki/int-rsa-b.cert.pem",
+-			"test/certs/webpki/int-rsa-c.cert.pem",
+-			"test/certs/webpki/int-ecdsa-a.cert.pem",
+-			"test/certs/webpki/int-ecdsa-b.cert.pem",
+-			"test/certs/webpki/int-ecdsa-c.cert.pem"
++			"test/certs/webpki/int-rsa-a.cert.pem"
+ 		],
++		"localStorePath": "/var/www/html/crl",
+ 		"s3Endpoint": "http://localhost:4501",
+ 		"s3Bucket": "lets-encrypt-crls",
+ 		"awsConfigFile": "test/config/crl-storer.ini",

@@ -1,0 +1,39 @@
+diff --git a/test/config/wfe2.json b/test/config/wfe2.json
+index 6a5f95ef0..b880db50f 100644
+--- a/test/config/wfe2.json
++++ b/test/config/wfe2.json
+@@ -12,6 +12,7 @@
+ 		"debugAddr": ":8013",
+ 		"directoryCAAIdentity": "happy-hacker-ca.invalid",
+ 		"directoryWebsite": "https://github.com/letsencrypt/boulder",
++		"hostnamePolicyFile": "test/hostname-policy.yaml",
+ 		"legacyKeyIDPrefix": "http://boulder.service.consul:4000/reg/",
+ 		"goodkey": {},
+ 		"tls": {
+@@ -77,26 +78,6 @@
+ 			[
+ 				"test/certs/webpki/int-rsa-a.cert.pem",
+ 				"test/certs/webpki/root-rsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-rsa-b.cert.pem",
+-				"test/certs/webpki/root-rsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-a.cert.pem",
+-				"test/certs/webpki/root-ecdsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-b.cert.pem",
+-				"test/certs/webpki/root-ecdsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-a-cross.cert.pem",
+-				"test/certs/webpki/root-rsa.cert.pem"
+-			],
+-			[
+-				"test/certs/webpki/int-ecdsa-b-cross.cert.pem",
+-				"test/certs/webpki/root-rsa.cert.pem"
+ 			]
+ 		],
+ 		"staleTimeout": "5m",

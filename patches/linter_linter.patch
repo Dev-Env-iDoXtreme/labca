@@ -1,0 +1,27 @@
+diff --git a/linter/linter.go b/linter/linter.go
+index e9bf33b85..e88cc6b7f 100644
+--- a/linter/linter.go
++++ b/linter/linter.go
+@@ -200,10 +200,21 @@ func makeIssuer(realIssuer *x509.Certificate, lintSigner crypto.Signer) (*x509.C
+ 		SubjectKeyId:                realIssuer.SubjectKeyId,
+ 		URIs:                        realIssuer.URIs,
+ 		UnknownExtKeyUsage:          realIssuer.UnknownExtKeyUsage,
++		// Deal with UTF8String elements in the subject that get lost in the strings in the pkix.Name struct
++		RawSubject:                  realIssuer.RawSubject,
+ 	}
+ 	lintIssuerBytes, err := x509.CreateCertificate(rand.Reader, lintIssuerTBS, lintIssuerTBS, lintSigner.Public(), lintSigner)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to create lint issuer: %w", err)
++		// Deal with mixed RSA/ECDSA root and issuer certificates
++		if strings.Contains(fmt.Sprint(err), "requested SignatureAlgorithm does not match private key type") {
++			lintIssuerTBS.SignatureAlgorithm = 0
++			lintIssuerBytes, err = x509.CreateCertificate(rand.Reader, lintIssuerTBS, lintIssuerTBS, lintSigner.Public(), lintSigner)
++			if err != nil {
++				return nil, fmt.Errorf("failed to create lint issuer (without SignatureAlgorithm): %w", err)
++			}
++		} else {
++			return nil, fmt.Errorf("failed to create lint issuer: %w", err)
++		}
+ 	}
+ 	lintIssuer, err := x509.ParseCertificate(lintIssuerBytes)
+ 	if err != nil {
